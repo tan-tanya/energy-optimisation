@@ -1,14 +1,12 @@
 # energy-optimisation
 
-Optimal sizing of on-site electricity and heating systems for UK non-domestic buildings, across nine Met Office climate districts and four building activity classes.
+Optimal sizing and dispatch of on-site electricity and heating systems for UK non-domestic buildings, across nine UK districts and four building activity classes.
 
 The model builds half-hourly building demand profiles from published benchmarks, then solves a linear program that sizes rooftop PV, battery storage, thermal storage and a heating system over a 15-year horizon — ranking each configuration against a gas-boiler business-as-usual baseline on both net present value and cumulative carbon.
 
-MECH70038 Research Project.
-
 ---
 
-## What it does
+## Methodology
 
 **1. Demand modelling.** Half-hourly electricity and heat profiles per (district, activity), assembled from CIBSE annual benchmarks, NCM occupancy schedules, TM46 baseload/HDD splits, Met Office degree-days and sunshine hours, and ERA5 hourly temperatures.
 
@@ -39,8 +37,6 @@ Requires Python ≥ 3.12. Dependencies are managed with [uv](https://docs.astral
 ```bash
 uv sync --extra optim
 ```
-
-⚠️ **The `--extra optim` matters.** A plain `uv sync` installs the demand-profile stack only. The solver dependencies (PuLP + HiGHS) live in an optional extra — without them the demand model runs but the optimiser will not.
 
 ---
 
@@ -81,26 +77,6 @@ python demand_profile_model.py
 ```
 
 Generates profiles and plots without touching the solver. Also importable — this is how the optimiser consumes demand.
-
-### Sensitivities standalone
-
-```bash
-python pv_panel1_sensitivity.py
-```
-
-```bash
-python ashp_grant_aerona3_sensitivity.py
-```
-
-⚠️ Both are dispatch-only re-solves against the **most recently modified** `outputs/Optimisation (*)` directory. On a fresh clone no such directory exists and they exit with `FileNotFoundError` — run the main pipeline first. This is expected behaviour, not a bug.
-
-### Reproducing the grid headroom figures
-
-```bash
-python scripts/headroom_medians.py --verify
-```
-
-Recomputes the per-district DNO headroom values in `data/model_parameters.xlsx` from the raw DNO files. The estimator is the median of non-zero headroom values — a plain median collapses into the large mass of zero-headroom substations. `--apply` writes the results back into the workbook.
 
 ---
 
