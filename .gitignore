@@ -1,0 +1,25 @@
+# --- Secrets -----------------------------------------------------------------
+.env
+.env.*
+
+# --- Python ------------------------------------------------------------------
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Model run artefacts -----------------------------------------------------
+# Every writer calls os.makedirs(exist_ok=True), so these self-create on first run.
+outputs/
+# cache/ is deliberately NOT ignored: the OSM checkpoint CSVs pin the building
+# data to what the model was actually run against (see api_osm_storeys.py).
+
+# --- Editor / OS -------------------------------------------------------------
+.claude/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# --- Excel lock files (model_parameters.xlsx is often open) -------------------
+~$*.xlsx

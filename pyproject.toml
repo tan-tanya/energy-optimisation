@@ -1,0 +1,27 @@
+[project]
+name = "demand-profiles"
+version = "0.1.0"
+description = "Building energy demand profile model"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "marimo>=0.19.4",
+    "matplotlib>=3.7",
+    "numpy>=2.0",
+    "odfpy>=1.4",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "plotly>=6.0",
+    "poethepoet>=0.38.0",
+    "polars>=1.0",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+# Solver stack (PuLP + HiGHS) for optimisation_model.py and the sensitivity
+# scripts. NOT installed by a plain `uv sync` — the demand-profile model runs
+# without it, the optimiser does not. Install with: uv sync --extra optim
+optim = [
+    "pulp>=2.8",
+    "highspy>=1.7",
+]
