@@ -3,10 +3,16 @@ Import-only.
 
 Rendering layer for demand_profile_model (builds Excel sheets and demand plots. 
 
-Imported by demand_profile_model (which re-exports build_benchmark_sheet / build_demand_sheet / generate_demand_plots) and notebooks/demand. 
+Imported by demand_profile_model (which re-exports build_benchmark_sheet / build_demand_sheet /
+generate_demand_plots / generate_all_demand_plots) and notebooks/demand.
+
+generate_demand_plots() renders one district; generate_all_demand_plots() renders every district
+into a single `demand/` folder and is what both demand_profile_model.main() and
+optimisation_model.main() call.
 """
 
 import os
+import re
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -148,7 +154,7 @@ def _to_hourly_kwh(half_hour_kw_per_sqm: np.ndarray, activity: str) -> np.ndarra
     return (p[::2] + p[1::2]) * 0.5 * dpm.bees_floor_areas[activity]
 
 def _render_daily_profile_charts(periods, get_profile, n_rows, fig_h, subdir,
-                                 slug_prefix, label, activities):
+                                 slug_prefix, label, activities, file_prefix=""):
     """One stacked-subplot chart per (heating, energy_type) combination."""
     os.makedirs(subdir, exist_ok=True)
     hours   = np.arange(24)
@@ -187,13 +193,14 @@ def _render_daily_profile_charts(periods, get_profile, n_rows, fig_h, subdir,
                    bbox_to_anchor=(1.18, 0.97))
 
         plt.tight_layout(rect=[0, 0, 0.85, 1])
-        slug  = f"{slug_prefix}_{heating.replace(' ', '_')}_{etype}"
+        slug  = f"{file_prefix}{slug_prefix}_{heating.replace(' ', '_')}_{etype}"
         fpath = os.path.join(subdir, f"{slug}.png")
         fig.savefig(fpath, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {fpath}")
 
-def _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, subdir, label, district: str = None):
+def _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, subdir, label, district: str = None,
+                          file_prefix=""):
     """One 24×24 heatmap (12 months × WD/WE × 24 h) per (heating, energy_type)."""
     os.makedirs(subdir, exist_ok=True)
     acts    = activities or list(dpm.base_load_fracs.keys())
@@ -248,14 +255,16 @@ def _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, subdir, label, dist
 
         cbar = fig.colorbar(im_ref, ax=axes_flat.tolist(), label="kWh per hour", shrink=0.8)
         cbar.ax.tick_params(labelsize=8)
-        slug  = f"WD_WE_{heating.replace(' ', '_')}_{etype}"
+        slug  = f"{file_prefix}WD_WE_{heating.replace(' ', '_')}_{etype}"
         fpath = os.path.join(subdir, f"{slug}.png")
         fig.savefig(fpath, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {fpath}")
 
 def generate_demand_plots(degree_days: dict, daily_hdd: float, label: str, monthly_dd: dict = None, activities: list = None,
-                          out_dir: str = OUTPUTS_DIR, district: str = None):
+                          out_dir: str = OUTPUTS_DIR, district: str = None, file_prefix: str = ""):
+    """Every chart for ONE district. `file_prefix` is prepended to each filename so several
+    districts can share one output folder without overwriting each other."""
     os.makedirs(out_dir, exist_ok=True)
 
     def seasonal_profile(act, heating, etype, season):
@@ -265,7 +274,7 @@ def generate_demand_plots(degree_days: dict, daily_hdd: float, label: str, month
         return p
 
     _render_daily_profile_charts(SEASON_ORDER_BENCHMARK, seasonal_profile,
-                                 5, 22, out_dir, "Seasonal", label, activities)
+                                 5, 22, out_dir, "Seasonal", label, activities, file_prefix)
 
     if monthly_dd is not None:
         def monthly_profile(act, heating, etype, month):
@@ -274,5 +283,33 @@ def generate_demand_plots(degree_days: dict, daily_hdd: float, label: str, month
             return half_hourly_kw_per_sqm(act, heating, etype, parent, m_dd, daily_hdd, district).copy()
 
         _render_daily_profile_charts(MONTHS_ORDER, monthly_profile,
-                                     12, 44, out_dir, "Monthly", label, activities)
-        _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, out_dir, label, district)
+                                     12, 44, out_dir, "Monthly", label, activities, file_prefix)
+        _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, out_dir, label, district, file_prefix)
+
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
+
+
+def generate_all_demand_plots(out_dir: str, districts: list = None, activities: list = None) -> str:
+    """Render the complete demand chart set into a single `demand/` folder under out_dir.
+
+    A separate profile is generated for every (district, activity class) pair, so no one chart
+    can stand in for the sweep — this writes them all. Per district: seasonal and monthly daily
+    profiles plus the monthly WD/WE heatmap, each in the five (heating system, energy type)
+    combinations that carry load, with all activity classes drawn on the same axes. Filenames are
+    district-prefixed so the flat folder stays collision-free.
+    """
+    if dpm.degree_days_by_district is None:
+        dpm.initialize()
+    demand_dir = os.path.join(out_dir, "demand")
+    os.makedirs(demand_dir, exist_ok=True)
+    dists = districts or list(dpm.degree_days_by_district.keys())
+    for i, d in enumerate(dists, 1):
+        print(f"[demand charts {i}/{len(dists)}] {d}")
+        generate_demand_plots(dpm.degree_days_by_district[d], dpm.daily_hdd_by_district[d], d,
+                              monthly_dd=dpm.monthly_dd_by_district[d], activities=activities,
+                              out_dir=demand_dir, district=d, file_prefix=f"{_slug(d)}_")
+    n = len([f for f in os.listdir(demand_dir) if f.endswith(".png")])
+    print(f"Demand charts: {n} files in {demand_dir}")
+    return demand_dir

@@ -26,13 +26,15 @@ stage-2 dispatch is re-solved with:
     reference point; cold-weather sensitivity is assumed identical to the current model).
   - HEAT_COSTS["ASHP"]["capex_per_kwth"] cut by CAPEX_REDUCTION_FRAC, paired with the COP cut
     (2.66 / 2.7283 - 1 = -2.5%; CAPEX_REDUCTION_FRAC set to the requested -2.6%).
-Baseline (current-COP) metrics are read straight from the saved CSV rather than re-solved -- same
+Baseline (current-COP) metrics are read straight from the deterministic sweep rows rather than
+re-solved -- same
 validated shortcut as pv_panel1_sensitivity.py (fixed sizing + dispatch-only re-solve reproduces a
 fresh full re-solve's total_cost_npv_GBP to within a rounding error, confirmed for the PV case on
 2026-07-08; the mechanism is identical here, only the perturbed technology differs).
 
 Output: <run folder>/ashp_grant_aerona3_sensitivity.xlsx, one row per ASHP design, in the same
-NPV-savings-ranked row order as the source cost_deterministic_results.csv.
+NPV-savings-ranked row order as the source deterministic sweep (the "NPV Data" sheet of
+Optimisation Results (deterministic).xlsx).
 """
 import argparse
 import glob
@@ -105,6 +107,17 @@ def _latest_run_dir() -> str:
     return max(runs, key=os.path.getmtime)
 
 
+def _read_deterministic_rows(run_dir: str) -> pd.DataFrame:
+    # The deterministic sweep rows, straight off the workbook the pipeline writes at the end of a
+    # run — the same frame run_ashp_sensitivity() is handed in-process. Only the standalone entry
+    # point needs this; a run interrupted before its workbooks were written has nothing to re-read.
+    wb = os.path.join(run_dir, "Optimisation Results (deterministic).xlsx")
+    if not os.path.exists(wb):
+        raise FileNotFoundError(f"No deterministic workbook in {run_dir} — the run did not get as "
+                                f"far as writing its workbooks, so there are no rows to re-use.")
+    return pd.read_excel(wb, sheet_name="NPV Data")
+
+
 def _pool_init():
     # Runs once per worker process. Every task this pool ever runs is a Grant-Aerona3 solve, so the
     # ASHP tech-param swap happens once here rather than per task.
@@ -121,7 +134,7 @@ def _solve_one(task: tuple) -> dict:
     prob += V["n_pv"]       == n_pv,       "fix_n_pv"
     prob += V["e_batt"]     == e_batt,     "fix_e_batt"
     prob += V["o_batt"]     == o_batt,     "fix_o_batt"
-    # Floors, not equalities -- same rationale as pv_panel1_sensitivity.py: the saved CSV rounds
+    # Floors, not equalities -- same rationale as pv_panel1_sensitivity.py: the saved rows round
     # both to 1 dp, and thermal capacity is unaffected by the COP change (COP only changes the
     # electrical input needed for a given thermal output), so pinning it exactly risks a spurious
     # infeasibility from rounding rather than reflecting anything about Grant Aerona3 itself.
@@ -137,8 +150,8 @@ def _solve_one(task: tuple) -> dict:
 def run_ashp_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: int = 600,
                          n_jobs: int = None, limit: int = None) -> pd.DataFrame:
     """Library entry point — called by optimisation_model.main() with the fresh deterministic
-    cost-round DataFrame, and by this module's own CLI with the same frame read back from
-    cost_deterministic_results.csv.
+    cost-round DataFrame, and by this module's own CLI with the same frame read back from the
+    "NPV Data" sheet of the deterministic workbook.
 
     Passing the in-memory frame is what makes this safe to run in-pipeline: the fixed-sizing
     re-solve pins n_pv to the saved design, so a saved run that predates a change to the roof-area
@@ -247,7 +260,7 @@ def main():
 
     run_dir = _latest_run_dir()
     print(f"Latest run: {run_dir}")
-    all_rows = pd.read_csv(os.path.join(run_dir, "cost_deterministic_results.csv"))
+    all_rows = _read_deterministic_rows(run_dir)
     run_ashp_sensitivity(all_rows, run_dir, time_limit_s=args.time_limit,
                          n_jobs=args.jobs, limit=args.limit)
 

@@ -23,3 +23,7 @@ desktop.ini
 
 # --- Excel lock files (model_parameters.xlsx is often open) -------------------
 ~$*.xlsx
+
+# --- Thesis / personal admin -------------------------------------------------
+# Thesis LaTeX source, schematics and planning docs. Not part of the model.
+.admin/

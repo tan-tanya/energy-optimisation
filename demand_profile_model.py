@@ -21,7 +21,7 @@ Data layers:
     (d) BEES median floor area per sub-sector (sample building size)
     (e) BEES base load fractions (always-on electricity share)
     (f) UKPN EV charging profile shape + per-activity EV demand parameters
-    (g) Met Office sunshine hours (monthly lighting factor)
+    (g) Met Office sunshine hours (monthly lighting factor — scales monthly energy, not intra-day shape)
     (h) Met Office heating degree-days (seasonal / monthly stats per district)
     (i) ERA5 hourly temperature diurnal anomaly (real intra-day shape; sinusoid is the fallback)
 
@@ -144,8 +144,10 @@ SEASON_ORDER_BENCHMARK = ["Summer", "Autumn", "Winter", "Peak Winter", "Spring"]
 SEASON_ORDER_DEMAND    = ["Spring", "Summer", "Autumn", "Winter", "Peak Winter"]  # Demand Outputs sheet
 MAIN_SEASONS           = ["Summer", "Autumn", "Winter", "Spring"]                 # excludes Peak Winter
 
-# Solar geometry drives both intra-day temperature shape and the lighting demand shape. 
-# DIURNAL_AMPLITUDE only drives temperature, and only used when no district is passed to hourly_temp_profile(), 
+# Solar geometry drives the intra-day temperature shape only. Electricity demand takes no intra-day
+# daylight shape: the sunshine-derived light factor scales a month's non-base electricity as a whole
+# (see _season_context), while occupancy alone distributes it within the day.
+# DIURNAL_AMPLITUDE only drives temperature, and only used when no district is passed to hourly_temp_profile(),
 # or ERA5 data is unavailable for it, otherwise the real ERA5 diurnal anomaly is used instead.
 # Sinusoid source: UK Met Office climate statistics; consistent with CIBSE Guide A §2.3.
 
@@ -306,28 +308,18 @@ def _season_context(activity: str, season: str, daily_hdd: float,
     # Fall back to the occupancy shape when no heating is needed all day.
     heat_norm    = heat_h / heat_h.sum() if heat_h.sum() > 1e-9 else heat_norm
     uniform      = np.ones(24) / 24
-    solar_h      = solar_elevation_profile(season)
-    w_solar      = (occ_norm * solar_h).sum()
-    w_dark       = 1.0 - w_solar
-    # light_fac is normalised so the day-weighted annual mean = 1.0.
-    #   - light_fac <= 1 (bright months): DIM during daylight — light_fac_h = 1 - solar_h*d,
-    #     d clamped to 1 so it never goes negative at solar noon.
-    #   - light_fac >  1 (dark months): BOOST during darkness (1 - solar_h) rather than daylight —
-    #     using solar_h here would flip the sign and put extra artificial-lighting load at solar noon instead of night.
-    if light_fac <= 1.0:
-        d_light     = min((1.0 - light_fac) / w_solar, 1.0) if w_solar > 1e-9 else 0.0
-        light_fac_h = 1.0 - solar_h * d_light
-    else:
-        b_light     = (light_fac - 1.0) / w_dark if w_dark > 1e-9 else 0.0
-        light_fac_h = 1.0 + (1.0 - solar_h) * b_light
+    # light_fac (normalised so the day-weighted annual mean = 1.0) redistributes the non-base
+    # electricity BETWEEN months — dark months draw more, bright months less — without changing the
+    # annual total. It scales the day's energy only; WITHIN the day the shape is occupancy alone.
+    # Commercial buildings are lit throughout trading hours regardless of daylight unless fitted with
+    # daylight-dimming control, which is not assumed here, so solar elevation sets no intra-day shape.
     d_base       = e * e_base * (1 - e_adj) / 365
-    d_occ_base   = e * (1 - e_base) * (1 - e_adj) / 365
+    d_occ_base   = e * (1 - e_base) * (1 - e_adj) * light_fac / 365
     d_dd_elec    = e * e_adj * hdd_ratio * (seasonal_hdd / daily_hdd) / 365
     return {
         "F": f, "F_adj": f_adj,
         "seasonal_HDD": seasonal_hdd, "hdd_ratio": hdd_ratio, "T_ext": t_ext,
         "occ_norm": occ_norm, "heat_norm": heat_norm, "uniform": uniform,
-        "light_fac_h": light_fac_h,
         "D_base": d_base, "D_occ_base": d_occ_base, "D_dd_elec": d_dd_elec,
     }
 
@@ -343,10 +335,10 @@ def _breakdown(activity: str, heating: str, season: str, daily_hdd: float,
     f, f_adj                       = c["F"], c["F_adj"]
     seasonal_HDD, hdd_ratio, t_ext = c["seasonal_HDD"], c["hdd_ratio"], c["T_ext"]
     occ_norm, heat_norm, uniform   = c["occ_norm"], c["heat_norm"], c["uniform"]
-    light_fac_h                    = c["light_fac_h"]
     d_base, d_occ_base, d_dd_elec  = c["D_base"], c["D_occ_base"], c["D_dd_elec"]
 
-    lsp_kW  = d_base * uniform + d_occ_base * occ_norm * light_fac_h
+    # d_occ_base already carries the month's light factor; occupancy sets the intra-day shape.
+    lsp_kW  = d_base * uniform + d_occ_base * occ_norm
     hvac_kW = d_dd_elec * occ_norm
 
     system = HEATING_SYSTEMS[heating]
@@ -799,19 +791,15 @@ def main():
     wb.save(out_path)
     print(f"Saved: {out_path}")
 
-    gen_plots = input("\nGenerate demand plots? (Y/N): ").strip().upper()
-    if gen_plots == "Y":
-        print("Generating demand plots …")
-        generate_demand_plots(dd, daily_hdd, selected_district,
-                              monthly_dd=monthly_dd_by_district[selected_district],
-                              activities=activities, out_dir=run_dir,
-                              district=selected_district)
-    else:
-        print("Skipping plot generation.")
+    # The workbook covers the selected cell, but the charts cover the whole model: one demand
+    # profile exists per (district, activity class), so a single cell's chart is not
+    # representative. Always render the full set into one demand/ folder.
+    print("\nGenerating demand plots (all districts × activity classes) …")
+    generate_all_demand_plots(run_dir)
 
 # Imported at the bottom to avoid circular import (demand_report imports this module for the physics).
 from demand_report import (
-    build_benchmark_sheet, build_demand_sheet, generate_demand_plots
+    build_benchmark_sheet, build_demand_sheet, generate_demand_plots, generate_all_demand_plots
     )
 
 

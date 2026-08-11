@@ -3,9 +3,12 @@ Run: python optimisation_model.py.
 Sizes electricity and heating systems per (district, activity, heating), and ranks combos by 15-year NPV vs gas-boiler BAU.
 
 Outputs (in outputs/Optimisation ({timestamp})/):
-1. Optimisation Results.xlsx (assembled by optimisation_report)
+1. Optimisation Results ({deterministic,stochastic}).xlsx (assembled by optimisation_report); one
+   per cost round, each carrying its own sweep rows on the NPV Data sheet   [--skip-stochastic]
 2. charts/{deterministic,stochastic}_*.png; every workbook figure as a standalone image
    (for reports / slides), one prefixed set per cost round   [--skip-stochastic]
+2b. demand/*.png; the complete demand-side chart set — every district × activity class ×
+   heating system × energy type, seasonal / monthly / WD-WE   [demand_report]
 3. Policy Recommendations.xlsx                  [--skip-policy]
 4. ashp_grant_aerona3_sensitivity.xlsx          [--skip-ashp-sensitivity]
 5. pv_panel1_sensitivity.xlsx                   [--skip-pv-sensitivity]
@@ -34,6 +37,8 @@ from optimisation_engine import (
     rank_all_combinations, _run_merged_sweep, assemble_pareto, write_results_workbook,
     _osm_survey_info,
 )
+# Demand-side charts (re-exported by demand_profile_model from demand_report).
+from demand_profile_model import generate_all_demand_plots
 
 
 # Two-round cost optimisation:
@@ -55,19 +60,6 @@ def _cost_round_specs(rounds: tuple = COST_ROUNDS) -> list:
         specs.append({"tag": name, "objective": "cost", "scenarios": scen, "sort_col": "npv_savings_GBP"})
     return specs
 
-_CMP_METRICS = ["pv_kwp", "e_batt_kwh", "e_th_kwh", "q_heat_cap_kwth", "capex_GBP",
-                "total_cost_npv_GBP", "npv_savings_GBP", "payback_years"]
-
-def _compare_cost_rounds(df_det: pd.DataFrame, df_sto: pd.DataFrame) -> pd.DataFrame:
-    # Per-cell side-by-side of the deterministic vs stochastic design, with sizing/cost deltas.
-    keys = ["district", "activity", "heating"]
-    cols = ["status"] + [c for c in _CMP_METRICS if c in df_det.columns and c in df_sto.columns]
-    m = df_det[keys + cols].merge(df_sto[keys + cols], on=keys, suffixes=("_det", "_sto"))
-    for c in ("pv_kwp", "e_batt_kwh", "e_th_kwh", "q_heat_cap_kwth", "total_cost_npv_GBP"):
-        if f"{c}_det" in m and f"{c}_sto" in m:
-            m[f"delta_{c}"] = m[f"{c}_sto"] - m[f"{c}_det"]
-    return m
-
 
 
 def main(argv=None):
@@ -88,9 +80,11 @@ def main(argv=None):
                         "sweep; drops the det-vs-sto comparison CSV, the stochastic workbook, and "
                         "the stochastic half of the policy rebates")
     p.add_argument("--skip-policy", action="store_true",
-                   help="skip the policy_recommendations.py rebate back-calculation after the cost "
-                        "rounds (4 bisections per round on the single best-NPV cell, ~7 re-solves "
-                        "each; measured ~3h45m for the stochastic round, ~4-5h30m for both)")
+                   help="skip the policy_recommendations.py lever back-calculation after the cost "
+                        "rounds: per activity class (4 of them, each at its own best-NPV district) "
+                        "5 bisections of ~7 re-solves plus a 21-step battery capex sweep, so ~285 "
+                        "solves per round. Measured ~3h45m for the stochastic round back when it "
+                        "was ~49 solves on one cell — budget most of a day per round now")
     p.add_argument("--skip-grid-sensitivity", action="store_true",
                    help="skip the grid_sensitivity.py DNO ceiling / demand-margin bisection after "
                         "the cost rounds (one bisection per district x activity x heat-pump heating, "
@@ -125,34 +119,51 @@ def main(argv=None):
     run_dir    = os.path.join("outputs", f"Optimisation ({_timestamp})")
     os.makedirs(run_dir, exist_ok=True)
 
+    # Demand charts first: they need no solve, take ~5 min against a multi-hour sweep, and every
+    # (district, activity) pair has its own profile — so the whole set is written, not one cell's.
+    # Running before the sweep means they survive an interrupted run.
+    print("\nRendering demand profile charts (all districts × activity classes) …")
+    generate_all_demand_plots(run_dir)
+
     # Full run (both objectives) → NPV + Carbon + Pareto workbook.
     print(f"\nNPV + Carbon objectives — cost rounds ({' + '.join(rounds)}) and carbon sweep "
           "across (district, activity, heating) …")
     cost_specs = _cost_round_specs(rounds)
-    specs = cost_specs + [{"tag": "emissions", "objective": "emissions", "scenarios": None,
-                           "sort_col": "emissions_saving_tco2e"}]
+    # One emissions sweep PER ROUND, each priced on that round's scenario set. The emissions
+    # objective never reads a price, so the design and its emissions come out identical either way —
+    # what changes is the cost reported alongside them. Solving it once on central prices left the
+    # stochastic workbook comparing 3-scenario costs against 1-scenario costs in assemble_pareto,
+    # which knocked genuinely cost-optimal designs off the front for no reason but the price basis.
+    emis_specs = [{"tag": f"emissions_{name}", "objective": "emissions",
+                   "scenarios": _scenarios_for_round(name),
+                   "sort_col": "emissions_saving_tco2e"} for name in rounds]
+    specs = cost_specs + emis_specs
     merged = _run_merged_sweep(specs, **common)
     cost_rounds = {}
     for spec in cost_specs:
         df = merged[spec["tag"]]
         df["round"] = spec["tag"]
         cost_rounds[spec["tag"]] = df
-    df_carbon = merged["emissions"]
+    carbon_rounds = {name: merged[f"emissions_{name}"] for name in rounds}
+    df_carbon = carbon_rounds[headline]
     df_npv = cost_rounds[headline]   # robust set is the headline when it was solved
-    for name, df in cost_rounds.items():
-        df.to_csv(os.path.join(run_dir, f"cost_{name}_results.csv"), index=False)
-    if len(cost_rounds) > 1:
-        cmp = _compare_cost_rounds(cost_rounds["deterministic"], cost_rounds["stochastic"])
-        cmp.to_csv(os.path.join(run_dir, "cost_round_comparison.csv"), index=False)
+    # No per-cell det-vs-sto comparison table is written. The two rounds do not share a price
+    # basis -- the stochastic scenario set is right-skewed, so its weighted mean import-price level
+    # is ~x1.31 against the deterministic x1.000 (see the Cover) -- and a side-by-side invites the
+    # cost gap to be read as a cost of ignoring uncertainty when it is mostly that level shift.
+    # The comparison that IS valid is stated in the write-up: first-stage sizing is identical in
+    # every cell bar sub-51 kWh moves in the thermal store, so the design is robust across the set.
     if not args.skip_policy:
         import policy_recommendations as polrec
         # Every solved round: the HP rebate is the one output where the det/sto delta is substantive
         # (heat pumps are the most import-price-exposed technology), so both are worth back-calculating.
         # run_policy_recommendations keys its output frames by round name and re-derives each round's
         # scenario set from that key, so passing cost_rounds straight through also honours
-        # --skip-stochastic. Costs ~4 tasks per round, and n_jobs is capped at logical//4.
-        print(f"\nBack-calculating policy rebates (battery + HP capex + HP elec-price, "
-              f"{' + '.join(rounds)}) …")
+        # --skip-stochastic. Every lever runs once per activity class (each in its own best-NPV
+        # district), so a round is ~104 tasks: 4 classes x (5 bisections + the 21-step battery capex
+        # sweep). n_jobs is capped at logical//4.
+        print(f"\nBack-calculating policy levers per end-user type (battery + HP capex + HP "
+              f"elec-price + export price + battery capex sweep, {' + '.join(rounds)}) …")
         polrec.run_policy_recommendations(
             cost_rounds,
             os.path.join(run_dir, "Policy Recommendations.xlsx"),
@@ -190,10 +201,14 @@ def main(argv=None):
               f"{n_drop_car} carbon cells)")
 
     for name, df_cost in cost_rounds.items():
-        dfp = df_pareto if df_cost is df_npv else assemble_pareto(df_cost, df_carbon)
+        # Both sheets of a workbook now come from the same price basis, so the Pareto dominance
+        # test compares like with like.
+        df_carb_r = carbon_rounds[name]
+        dfp = df_pareto if name == headline else assemble_pareto(df_cost, df_carb_r)
         out = os.path.join(run_dir, f"Optimisation Results ({name}).xlsx")
         print(f"\nBuilding {name} workbook -> {os.path.basename(out)}")
-        write_results_workbook({"NPV": df_cost, "Carbon": df_carbon, "Pareto": dfp}, out,
+        sheets = {"NPV": df_cost, "Carbon": df_carb_r, "Pareto": dfp}
+        write_results_workbook(sheets, out,
                                run_meta={"timestamp": _timestamp, "round": name},
                                scenarios=_scenarios_for_round(name),
                                grid_sensitivity=df_grid_sens)

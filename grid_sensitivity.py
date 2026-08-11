@@ -144,8 +144,12 @@ def _cell_row(om, district: str, activity: str, heating: str, status: str, *, sc
                                          grow=False, expand_factor=1.5, max_iter=max_iter,
                                          max_expand=11)
         margin_pct = (mult - 1.0) * 100.0
-        # Approximate kW-equivalent of the demand-growth margin: current_kw scaled by the same %
-        # (this assumes import draw grows roughly proportionally with demand — reasonable near the margin).
+        # Approximate kW-equivalent of the demand-growth margin, assuming import draw grows roughly
+        # proportionally with demand (reasonable near the margin). At the boundary the peak import sits
+        # ON the ceiling, so peak_now = current_kw / mult and the addable headroom is the difference:
+        #   current_kw - current_kw/mult == current_kw * (1 - 1/mult).
+        # NOT current_kw * (mult - 1), which is the same quantity inflated by a further factor of mult and
+        # can exceed the ceiling itself — impossible, since the ceiling bounds total import, not just growth.
         row.update({
             "mode": "demand_margin",
             "demand_growth_margin_pct": round(margin_pct, 1),
@@ -153,7 +157,7 @@ def _cell_row(om, district: str, activity: str, heating: str, status: str, *, sc
             "grid_import_threshold_kw": np.nan,
             "grid_shortfall_kw": np.nan,
             "edge_margin_pct": round(margin_pct, 1),
-            "edge_margin_kw": round(current_kw * margin_pct / 100.0, 1),
+            "edge_margin_kw": round(current_kw * (1.0 - 1.0 / mult), 1),
         })
     else:
         def test(kw):
