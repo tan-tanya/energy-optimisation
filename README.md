@@ -82,9 +82,8 @@ memory.
 python demand_profile_model.py
 ```
 
-Writes the full demand chart set — every district × activity class — to
-`outputs/Demand ({timestamp})/demand/`. Takes no arguments and prompts for nothing. Regenerates the
-projection CSVs first. Also importable — this is how the optimiser consumes demand.
+Writes the full demand chart set (every district × activity class) — to `outputs/Demand ({timestamp})/demand/`. 
+Also importable; this is how the optimiser consumes demand.
 
 ---
 
@@ -92,7 +91,7 @@ projection CSVs first. Also importable — this is how the optimiser consumes de
 
 | Module | Role |
 |---|---|
-| `optimisation_model.py` | Entry point — thin CLI over the engine |
+| `optimisation_model.py` | Entry point |
 | `optimisation_engine.py` | LP construction, solve, sweep and pool mechanics |
 | `optimisation_config.py` | Solver and horizon constants |
 | `optimisation_report.py` | Results workbook assembly |
@@ -100,7 +99,7 @@ projection CSVs first. Also importable — this is how the optimiser consumes de
 | `demand_profile_model.py` | Half-hourly demand profiles per district and activity |
 | `demand_report.py` | Demand chart rendering |
 | `model_params.py` | Technology costs and parameters, read from `data/model_parameters.xlsx` |
-| `districts.py` | District table — ICAO stations, UKCP regions, coordinates |
+| `districts.py` | District table (ICAO stations, UKCP regions, coordinates) |
 | `seasons.py` | Calendar / season conventions shared by the demand, optimisation and `api_` modules |
 | `datasets.py` | Input file loading |
 | `pricing.py` | Wholesale + DUoS + CCL import price build-up |
@@ -115,7 +114,8 @@ projection CSVs first. Also importable — this is how the optimiser consumes de
 | `api_temperature_profiles.py` | ERA5 hourly temperature via Open-Meteo |
 | `api_wholesale_prices.py` | Wholesale electricity price series |
 
-Modules prefixed `api_` pull live external data and write their output into `data/`. They are imported at runtime by other modules but only need re-running when refreshing the underlying data.
+Modules prefixed `api_` pull live external data and write their output into `data/`. 
+They are imported at runtime by other modules but only need re-running when refreshing the underlying data.
 
 ---
 
@@ -133,33 +133,4 @@ Modules prefixed `api_` pull live external data and write their output into `dat
 | `data/00 readme.xlsx` | Directory tab indexing every source | — |
 | `cache/` | OpenStreetMap survey checkpoints | OpenStreetMap |
 
-`cache/` is committed deliberately: it pins the building-stock survey to the data the model was actually run against, rather than whatever OpenStreetMap returns today.
-
-### Attribution
-
-The datasets in `data/` are redistributed under open licences that permit reuse with attribution:
-
-- **UKCP18 climate projections** — Open Government Licence v3.0. Requires the CEDA citation: *Met Office Hadley Centre (2018): UKCP18 [dataset]. Centre for Environmental Data Analysis.*
-- **UK Power Networks** — CC BY 4.0
-- **SSEN** — CC BY 4.0
-- **National Grid Electricity Distribution** — NGED Open Data Licence ("Supported by NGED Open Data")
-- **Northern Powergrid** — Northern Powergrid Open Data Licence v1.0
-- **DUoS Schedules of Charges** — published by DNOs under their licence conditions
-
-Full per-file attribution is being consolidated into the Directory tab of `data/00 readme.xlsx`.
-
----
-
-## Notes
-
-`outputs/` is not tracked. Every writer creates its own directory on first run.
-
-The model is a pure linear program: every decision variable is continuous. The relaxation was
-verified lossless against a mixed-integer formulation with explicit charge/discharge and
-import/export mutex binaries, and solves roughly 3× faster, so the binary formulation has been
-removed rather than left behind a flag.
-
-Appraisal is in real 2025 terms, discounted at the `discount_rate` on the Scalars sheet (3.5%, the
-HM Treasury Green Book STPR). Over the 15-year horizon the only replacement that falls inside the
-window is the PV inverter at year 10; the battery (15), thermal store (40) and every heating system
-(15/20) sit on or beyond the horizon end and are charged to neither the scenario nor the BAU.
+`cache/` pins the building-stock survey to the data the model was run against.
