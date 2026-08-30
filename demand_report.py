@@ -1,7 +1,7 @@
 """
-Import-only. Rendering layer for demand_profile_model - builds Excel sheets and demand plots. 
+Import-only. Rendering layer for demand_profile_model - builds the demand plots.
 
-Imported by demand_profile_model (build_*_sheet) and by optimisation_model (the demand chart set).
+Imported by demand_profile_model and by optimisation_model (both for the demand chart set).
 
 generate_demand_plots() renders one district; generate_all_demand_plots() renders every district
 into a single `demand/` folder and is what both demand_profile_model.main() and
@@ -14,20 +14,15 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
 
 import demand_profile_model as dpm
 from demand_profile_model import (
-    peak_scale_factor, half_hourly_kw_per_sqm, annual_demand_kwh,
-    seasonal_demand_kwh, sample_buildings,
-    HEATING_OPTIONS, HEATING_SYSTEMS, SEASON_ORDER_BENCHMARK, SEASON_ORDER_DEMAND,
-    MONTHS_ORDER, MONTH_SEASON, OUTPUTS_DIR,
+    peak_scale_factor, half_hourly_kw_per_sqm,
+    SEASON_ORDER_BENCHMARK, MONTHS_ORDER, MONTH_SEASON, OUTPUTS_DIR,
 )
 
 
 # 1 - CONSTANTS
-ALT_COLORS = ["F2F7FB", "FFFFFF"]
 ACT_PLOT_COLORS = {
     "Health: Health centre":    "#C0392B",
     "Health: Hospital":         "#E67E22",
@@ -49,102 +44,7 @@ PLOT_COMBINATIONS = [   # (heating, energy_type) combinations that produce non-z
 ]
 
 
-# 2 - OUTPUT WORKBOOK BUILDERS
-def header_style(cell):
-    cell.fill      = PatternFill("solid", start_color="1F4E79")
-    cell.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-def thin_border():
-    s = Side(style="thin", color="D9D9D9")
-    return Border(left=s, right=s, top=s, bottom=s)
-
-def data_style(cell, color=None):
-    cell.font   = Font(name="Arial", size=10)
-    cell.border = thin_border()
-    if color:
-        cell.fill = PatternFill("solid", start_color=color)
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-
-def build_benchmark_sheet(ws, degree_days: dict, daily_hdd: float, activities=None, district: str = None):
-    row1  = ["NDB_ActivityClass", "NDB_HeatingOption", "Energy Demand Type", "BaseDiurnalTimeSlice"]
-    row1 += ["BaseCDay", "Benchmark kW per sqm"] * len(SEASON_ORDER_BENCHMARK)
-    for col_idx, val in enumerate(row1, 1):
-        header_style(ws.cell(row=1, column=col_idx, value=val))
-
-    col_widths = [22, 18, 20, 22] + [14, 22] * len(SEASON_ORDER_BENCHMARK)
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.row_dimensions[1].height = 30
-
-    row_num = 2
-    acts = activities or list(dpm.base_load_fracs.keys())
-    for act in acts:
-        for heating in HEATING_OPTIONS:
-            peak_scale   = peak_scale_factor(act, heating, degree_days, daily_hdd, district)
-            energy_types = ["Electricity"] if HEATING_SYSTEMS[heating]["is_heat_pump"] else ["Electricity", "Gas"]
-            for etype in energy_types:
-                profiles = {}
-                for s in SEASON_ORDER_BENCHMARK:
-                    p = half_hourly_kw_per_sqm(act, heating, etype, s, degree_days, daily_hdd, district)
-                    profiles[s] = p * peak_scale if s == "Peak Winter" else p
-
-                for ts in range(48):
-                    color    = ALT_COLORS[row_num % 2]
-                    row_data = [act, heating, etype, ts]
-                    for s in SEASON_ORDER_BENCHMARK:
-                        row_data += [s, round(profiles[s][ts], 5)]
-                    for col_idx, val in enumerate(row_data, 1):
-                        cell = ws.cell(row=row_num, column=col_idx, value=val)
-                        data_style(cell, color)
-                        if isinstance(val, float):
-                            cell.number_format = "0.00000"
-                    row_num += 1
-    ws.freeze_panes = "A2"
-
-def build_demand_sheet(ws, degree_days: dict, daily_hdd: float, activities=None, district: str = None):
-    cols = [
-        "NDBuildingID", "ActivityName", "FloorArea (m²)", "NDB_RetrofittingOption",
-        "AnnualEnergyDemandTotal (kWh)", "AnnualEnergyDemandElectricity (kWh)", "AnnualEnergyDemandGas (kWh)",
-    ] + [
-        f"{s.replace(' ', '')}{sfx}"
-        for s in SEASON_ORDER_DEMAND
-        for sfx in ("EnergyDemandTotal (kWh)", "EnergyDemandElectricity (kWh)", "EnergyDemandGas (kWh)")
-    ]
-    col_widths = [16, 28, 14, 28, 36, 36, 36] + [40, 44, 40] * len(SEASON_ORDER_DEMAND)
-    for col_idx, (h, w) in enumerate(zip(cols, col_widths), 1):
-        cell = ws.cell(row=1, column=col_idx, value=h)
-        header_style(cell)
-        ws.column_dimensions[get_column_letter(col_idx)].width = w
-    ws.row_dimensions[1].height = 30
-
-    acts     = activities or list(dpm.base_load_fracs.keys())
-    filtered = [b for b in sample_buildings() if b["activity"] in acts]
-
-    for row_offset, bldg in enumerate(filtered, 2):
-        color   = ALT_COLORS[row_offset % 2]
-        act     = bldg["activity"]
-        heating = bldg["heating"]
-        area    = bldg["area"]
-
-        annual   = annual_demand_kwh(act, heating, daily_hdd)
-        ann_elec = round(annual["electricity"] * area)
-        ann_gas  = round(annual["gas"]         * area)
-
-        row_vals = [bldg["id"], bldg["name"], area, heating.upper().replace(" ", "_"),
-                    ann_elec + ann_gas, ann_elec, ann_gas]
-        for s in SEASON_ORDER_DEMAND:
-            row_vals += list(seasonal_demand_kwh(act, heating, s, area, degree_days, daily_hdd, district))
-
-        for col_idx, val in enumerate(row_vals, 1):
-            cell = ws.cell(row=row_offset, column=col_idx, value=val)
-            data_style(cell, color)
-            if isinstance(val, (int, float)) and col_idx >= 3:
-                cell.number_format = "#,##0"
-    ws.freeze_panes = "A2"
-
-
-# 3 - PLOTTING
+# 2 - PLOTTING
 def _to_hourly_kwh(half_hour_kw_per_sqm: np.ndarray, activity: str) -> np.ndarray:
     """kWh per hour = (slot_a + slot_b) × 0.5 h × floor_area."""
     p = np.asarray(half_hour_kw_per_sqm)

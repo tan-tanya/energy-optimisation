@@ -2,7 +2,7 @@
 
 Optimal sizing and dispatch of on-site electricity and heating systems for UK non-domestic buildings, across nine UK districts and four building activity classes.
 
-The model builds half-hourly building demand profiles from published benchmarks, then solves a linear program that sizes rooftop PV, battery storage, thermal storage and a heating system over a 15-year horizon — ranking each configuration against a gas-boiler business-as-usual baseline on both net present value and cumulative carbon.
+The model builds half-hourly building demand profiles from published benchmarks, then solves a linear program (LP) that sizes rooftop PV, battery storage, thermal storage and a heating system over a 15-year horizon, ranking each configuration against a gas-boiler business-as-usual baseline on both net present value and cumulative carbon.
 
 ---
 
@@ -10,9 +10,9 @@ The model builds half-hourly building demand profiles from published benchmarks,
 
 **1. Demand modelling.** Half-hourly electricity and heat profiles per (district, activity), assembled from CIBSE annual benchmarks, NCM occupancy schedules, TM46 baseload/HDD splits, Met Office degree-days and sunshine hours, and ERA5 hourly temperatures.
 
-**2. Optimisation.** For each (district, activity, heating) cell, a linear program sizes PV, battery, thermal store and heating capacity to minimise discounted total cost, subject to energy balance, roof area, grid import/export limits and land availability.
+**2. Optimisation.** For each (district, activity, heating) cell, the LP sizes PV, battery, thermal store and heating capacity to minimise discounted total cost, subject to energy balance, roof area, grid import/export limits and land availability.
 
-**3. Uncertainty.** A two-stage stochastic program over reduced electricity import-price scenarios, run alongside a deterministic central-price round for comparison.
+**3. Uncertainty.** A two-stage stochastic program (TSSP) over reduced electricity import-price scenarios, run alongside a deterministic central-price round for comparison.
 
 **4. Downstream analysis.** Carbon objective and epsilon-constraint Pareto fronts, grid-headroom sensitivity, back-calculated capital-cost rebates needed to make heat pumps viable per region, and two technology sensitivities (a cheaper low-efficiency PV panel, a lower-COP air-source heat pump).
 
@@ -26,7 +26,9 @@ Scope: 9 districts × 4 activities × 4 heating systems.
 | England SE and Central S | Retail: Department store | GSHP (horizontal) |
 | England SW and S Wales | | |
 | Midlands | | |
-| Scotland E / N / W | | |
+| Scotland E | | |
+| Scotland N | | |
+| Scotland W | | |
 
 ---
 
@@ -50,13 +52,11 @@ python optimisation_model.py
 
 Writes everything to a timestamped `outputs/Optimisation (YYYYMMDD, HHMM)/` directory: the results workbook, standalone chart PNGs, policy recommendations, and both sensitivity workbooks.
 
-⚠️ **This takes around 31 hours.** The stochastic round is roughly 13× the cost of the deterministic one. To skip it:
+**The entire run takes around 31 hours.** By skipping the stochastic round, the run can be brought down to 9-10 hours:
 
 ```bash
 python optimisation_model.py --skip-stochastic
 ```
-
-That brings it down to about 9–10 hours.
 
 Useful flags:
 
@@ -82,9 +82,9 @@ memory.
 python demand_profile_model.py
 ```
 
-Prompts for a district and activity class, then writes that cell's `Demand Profiles.xlsx` plus the
-full demand chart set. Regenerates the projection CSVs first. Also importable — this is how the
-optimiser consumes demand.
+Writes the full demand chart set — every district × activity class — to
+`outputs/Demand ({timestamp})/demand/`. Takes no arguments and prompts for nothing. Regenerates the
+projection CSVs first. Also importable — this is how the optimiser consumes demand.
 
 ---
 
@@ -98,7 +98,7 @@ optimiser consumes demand.
 | `optimisation_report.py` | Results workbook assembly |
 | `optimisation_plots.py` | Chart generation |
 | `demand_profile_model.py` | Half-hourly demand profiles per district and activity |
-| `demand_report.py` | Demand workbook output |
+| `demand_report.py` | Demand chart rendering |
 | `model_params.py` | Technology costs and parameters, read from `data/model_parameters.xlsx` |
 | `districts.py` | District table — ICAO stations, UKCP regions, coordinates |
 | `seasons.py` | Calendar / season conventions shared by the demand, optimisation and `api_` modules |

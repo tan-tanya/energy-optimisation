@@ -9,10 +9,8 @@ Inputs
 4. data/api_temperature_profiles.xlsx; ERA5 hourly temperature (Open-Meteo) per district/season 
 
 Outputs (only generated when script is run directly):
-1. outputs/{district} - {activity} ({timestamp})/Demand Profiles.xlsx; sheets as follows
-    - Energy Profiles          (half-hourly kW/m² benchmarks per season)
-    - Demand Outputs           (annual + seasonal kWh totals per sample building)
-2. *.png; seasonal / monthly / WD-WE heatmap demand plots
+1. outputs/Demand ({timestamp})/demand/*.png; seasonal / monthly / WD-WE heatmap demand
+   plots, for every district x activity class
 
 Data layers:
     (a) CIBSE annual energy benchmarks (typical kWh/m²/y per activity class)
@@ -32,7 +30,7 @@ Model parameters:
 
 Pipeline:
     1. initialize()   loads all source data into module-level state
-    2. main()         prompts for district + activity, builds workbook and plots
+    2. main()         builds the full chart set across all districts x activity classes
 """
 
 import functools
@@ -43,7 +41,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import datasets   # ERA5 hourly-temperature diurnal shape (real, vs the sinusoid fallback) reads through here
-import openpyxl   # main() builds the demo workbook; styling/plots live in demand_report.py
 from districts import DISTRICT_STATIONS
 from seasons import MONTH_SEASON, MONTH_DAYS, MONTHS_ORDER
 from model_params import (
@@ -126,8 +123,7 @@ BASE_LOAD_CFG = {
 # First day-of-year of each month. Evaluates 1.5 m ground temperature / brine COP for every calendar day in a month
 MONTH_START_DOY  = {m: 1 + sum(MONTH_DAYS[mm] for mm in MONTHS_ORDER[:i])
                     for i, m in enumerate(MONTHS_ORDER)}
-SEASON_ORDER_BENCHMARK = ["Summer", "Autumn", "Winter", "Peak Winter", "Spring"]  # Energy Profiles sheet
-SEASON_ORDER_DEMAND    = ["Spring", "Summer", "Autumn", "Winter", "Peak Winter"]  # Demand Outputs sheet
+SEASON_ORDER_BENCHMARK = ["Summer", "Autumn", "Winter", "Peak Winter", "Spring"]  # seasonal chart order
 MAIN_SEASONS           = ["Summer", "Autumn", "Winter", "Spring"]                 # excludes Peak Winter
 
 
@@ -386,16 +382,6 @@ def annual_demand_kwh(activity: str, heating: str, daily_hdd: float) -> dict:
     f_scaled = f * (1 - f_adj) + f * f_adj * hdd_ratio
     return {"electricity": e_scaled + ev, "gas": f_scaled}
 
-def building_halfhourly_kwh(activity: str, heating: str, season: str, floor_area: float,
-                            degree_days: dict, daily_hdd: float,
-                            district: str = None) -> dict:
-    elec = half_hourly_kw_per_sqm(activity, heating, "Electricity", season, degree_days, daily_hdd, district)
-    gas  = half_hourly_kw_per_sqm(activity, heating, "Gas",         season, degree_days, daily_hdd, district)
-    elec_kwh  = (elec * 0.5 * floor_area).tolist()
-    gas_kwh   = (gas  * 0.5 * floor_area).tolist()
-    total_kwh = [e + g for e, g in zip(elec_kwh, gas_kwh)]
-    return {"total": total_kwh, "electricity": elec_kwh, "gas": gas_kwh}
-
 @functools.lru_cache(maxsize=None)
 def _peak_scale_factor(activity: str, heating: str, daily_hdd: float,
                        seasonal_hdd_pw: float, light_fac_pw: float,
@@ -419,44 +405,6 @@ def wd_we_factors(activity: str) -> tuple:
     wd_fac = 7.0 / (5.0 + 2.0 * f)
     return wd_fac, wd_fac * f
 
-
-def sample_buildings() -> list:
-    """All (activity × heating) sample buildings."""
-    out = []
-    bid = 1
-    for act in ACTIVITY_LOOKUP:
-        for heating in HEATING_OPTIONS:
-            out.append({
-                "id":       bid,
-                "activity": act,
-                "name":     cibse_dashboard[act]["description"],
-                "area":     bees_floor_areas[act],
-                "heating":  heating,
-            })
-            bid += 1
-    return out
-
-def seasonal_demand_kwh(activity: str, heating: str, season: str, floor_area: float,
-                        degree_days: dict, daily_hdd: float, district: str = None) -> tuple:
-    """Seasonal kWh totals for one building: (total, electricity, gas), rounded to integers.
-    Peak Winter is the single coldest half-hour scaled to PEAK_FRACTION of annual demand."""
-    if season == "Peak Winter":
-        annual           = annual_demand_kwh(activity, heating, daily_hdd)
-        ann_total_per_m2 = annual["electricity"] + annual["gas"]
-        peak_kwh         = PEAK_FRACTION * ann_total_per_m2 * floor_area
-        b        = half_hourly_kw_per_sqm_breakdown(activity, heating, "Peak Winter", degree_days, daily_hdd, district)
-        elec_pw  = b["Lighting & Small Power"] + b["HVAC"] + b["Heat Pump"] + b["EV Charging"]
-        gas_pw   = b["Space Heating"] + b["Hot Water & Process"]
-        total_pw = elec_pw + gas_pw
-        ts       = int(np.argmax(total_pw))
-        e_frac   = float(elec_pw[ts] / total_pw[ts]) if total_pw[ts] > 0 else 1.0
-        return (round(peak_kwh), round(peak_kwh * e_frac), round(peak_kwh * (1.0 - e_frac)))
-
-    kwh = building_halfhourly_kwh(activity, heating, season, floor_area, degree_days, daily_hdd, district)
-    n   = degree_days[season]["n_days"]
-    return (round(sum(kwh["total"])       * n),
-            round(sum(kwh["electricity"]) * n),
-            round(sum(kwh["gas"])         * n))
 
 
 # 9 - LOADERS
@@ -652,19 +600,6 @@ def load_degree_days(raw_lf: dict, icao: str):
 
 
 # 10 - CLI / MAIN
-def _prompt_choice(prompt, options):
-    print(f"\n{prompt}")
-    for i, opt in enumerate(options, 1):
-        print(f"  {i}. {opt}")
-    while True:
-        try:
-            sel = int(input("Enter number: ").strip())
-            if 1 <= sel <= len(options):
-                return options[sel - 1]
-        except ValueError:
-            pass
-        print("Invalid selection")
-
 def initialize(verbose: bool = False):
     """Load all source data into module-level state.
     Set verbose=True to print derived intermediates (base load fractions, sunshine hours)."""
@@ -719,39 +654,17 @@ def main():
 
     initialize(verbose=False)
 
-    selected_district = _prompt_choice("Select district:", list(degree_days_by_district.keys()))
-    selected_activity = _prompt_choice("Select activity class:", list(base_load_fracs.keys()))
-    activities = [selected_activity]
-
-    dd        = degree_days_by_district[selected_district]
-    daily_hdd = daily_hdd_by_district[selected_district]
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-
-    print(f"\nBuilding benchmark profiles [{selected_district}] …")
-    build_benchmark_sheet(wb.create_sheet("Energy Profiles"), dd, daily_hdd,
-                          activities=activities, district=selected_district)
-
-    print(f"Building demand outputs [{selected_district}] …")
-    build_demand_sheet(wb.create_sheet("Demand Outputs"), dd, daily_hdd,
-                       activities=activities, district=selected_district)
-
-    safe_activity = selected_activity.replace(":", " -").replace("/", "")
-    timestamp     = datetime.now().strftime("%Y%m%d, %H%M")
-    run_dir       = os.path.join(OUTPUTS_DIR, f"{selected_district} - {safe_activity} ({timestamp})")
+    timestamp = datetime.now().strftime("%Y%m%d, %H%M")
+    run_dir   = os.path.join(OUTPUTS_DIR, f"Demand ({timestamp})")
     os.makedirs(run_dir, exist_ok=True)
 
-    out_path = os.path.join(run_dir, "Demand Profiles.xlsx")
-    wb.save(out_path)
-    print(f"Saved: {out_path}")
-    print("\nGenerating demand plots (all districts × activity classes) …")
+    n_districts  = len(degree_days_by_district)
+    n_activities = len(base_load_fracs)
+    print(f"\nGenerating demand plots ({n_districts} districts × {n_activities} activity classes) …")
     generate_all_demand_plots(run_dir)
 
 # Imported at the bottom to avoid circular import.
-from demand_report import (
-    build_benchmark_sheet, build_demand_sheet, generate_all_demand_plots
-    )
+from demand_report import generate_all_demand_plots
 
 
 if __name__ == "__main__":
