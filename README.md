@@ -63,12 +63,18 @@ Useful flags:
 | Flag | Effect |
 |---|---|
 | `--skip-stochastic` | Deterministic central-price round only |
+| `--skip-deterministic` | Stochastic round only — the second half of a split run |
 | `--skip-policy` | Skip the capital-rebate back-calculation |
 | `--skip-grid-sensitivity` | Skip the grid-headroom bisection |
+| `--grid-sensitivity-from RUN_DIR` | Reuse a completed run's grid-headroom results instead of re-solving |
 | `--skip-ashp-sensitivity` | Skip the Aerona3 heat-pump sensitivity |
 | `--skip-pv-sensitivity` | Skip the Panel-1 PV sensitivity |
-| `--jobs N` | Parallel worker processes |
+| `--jobs N` | Parallel worker processes (default: a quarter of the logical cores) |
 | `--time-limit S` | Per-solve time limit, seconds |
+
+The three stages that re-solve off the deterministic round — both technology sensitivities and the
+grid bisection — are skipped automatically under `--skip-deterministic`, since that round is not in
+memory.
 
 ### Demand profiles alone
 
@@ -76,7 +82,9 @@ Useful flags:
 python demand_profile_model.py
 ```
 
-Generates profiles and plots without touching the solver. Also importable — this is how the optimiser consumes demand.
+Prompts for a district and activity class, then writes that cell's `Demand Profiles.xlsx` plus the
+full demand chart set. Regenerates the projection CSVs first. Also importable — this is how the
+optimiser consumes demand.
 
 ---
 
@@ -93,6 +101,7 @@ Generates profiles and plots without touching the solver. Also importable — th
 | `demand_report.py` | Demand workbook output |
 | `model_params.py` | Technology costs and parameters, read from `data/model_parameters.xlsx` |
 | `districts.py` | District table — ICAO stations, UKCP regions, coordinates |
+| `seasons.py` | Calendar / season conventions shared by the demand, optimisation and `api_` modules |
 | `datasets.py` | Input file loading |
 | `pricing.py` | Wholesale + DUoS + CCL import price build-up |
 | `projections.py` | Climate and electricity demand projections |
@@ -145,4 +154,12 @@ Full per-file attribution is being consolidated into the Directory tab of `data/
 
 `outputs/` is not tracked. Every writer creates its own directory on first run.
 
-The model runs as a pure linear program by default. The relaxation was verified lossless against the mixed-integer formulation, and solves roughly 3× faster.
+The model is a pure linear program: every decision variable is continuous. The relaxation was
+verified lossless against a mixed-integer formulation with explicit charge/discharge and
+import/export mutex binaries, and solves roughly 3× faster, so the binary formulation has been
+removed rather than left behind a flag.
+
+Appraisal is in real 2025 terms, discounted at the `discount_rate` on the Scalars sheet (3.5%, the
+HM Treasury Green Book STPR). Over the 15-year horizon the only replacement that falls inside the
+window is the PV inverter at year 10; the battery (15), thermal store (40) and every heating system
+(15/20) sit on or beyond the horizon end and are charged to neither the scenario nor the BAU.

@@ -1,5 +1,5 @@
 """
-Wholesale + regional DUoS import-price build-up.
+Import-only. Wholesale + regional DUoS import-price build-up.
 
 Year-0 intra-day, regional, seasonal import price per (month, day_type, half-hour slot):
 - wholesale·HH-shape + per-DNO DUoS Red/Amber/Green + CCL + band-specific residual.
@@ -7,12 +7,13 @@ Year-0 intra-day, regional, seasonal import price per (month, day_type, half-hou
 DUoS unit rates and the Red/Amber/Green time-band windows are transcribed per district from each
 DNO's 2025/26 CDCM Schedule of Charges; wholesale is real Elexon MID 2025 (via api_wholesale_prices.py).
 
-The parsed build-up inputs are cached once per process. The scenario import-price PATH (escalation)
-is applied downstream by the optimisation model; this module only produces the year-0 central level.
+The parsed build-up inputs are cached once per process. The scenario import-price escalation is 
+applied downstream by the optimisation model; this module only produces the year-0 central level.
 """
 
 import demand_profile_model as dm
-from optimisation_config import HH_PER_DAY, T_RES_H, S_KEYS
+from seasons import HH_PER_DAY
+from optimisation_config import T_RES_H, S_KEYS
 
 _WD_BUILDUP = None   # cached parsed build-up inputs {wholesale, ccl, residual_by_band, bands, duos, shape}
 
@@ -36,7 +37,7 @@ def _load_wholesale_duos(path=None):
     if hdr is None:
         raise ValueError("Energy Prices sheet: header row (Group/Parameter/Value) not found")
     ccl = None
-    residual_by_band = {}        # {DESNZ import band name -> band-specific non-commodity residual}
+    residual_by_band = {}        # DESNZ import band name -> band-specific non-commodity residual
     bands, duos = {}, {}
     for r in range(hdr + 1, ws.max_row + 1):
         g     = ws.cell(row=r, column=cols["Group"]).value

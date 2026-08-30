@@ -12,13 +12,12 @@ Outputs (in outputs/Optimisation ({timestamp})/):
 3. Policy Recommendations.xlsx                  [--skip-policy]
 4. ashp_grant_aerona3_sensitivity.xlsx          [--skip-ashp-sensitivity]
 5. pv_panel1_sensitivity.xlsx                   [--skip-pv-sensitivity]
-   (grid sensitivity has no standalone file — it lands in the main workbook)
 
 Pipeline:
-    1. build_milp()                                 assemble the LP/MILP for one (district, activity)    [optimisation_engine]
-    2. solve_scenario()                             solve and extract sizing + cost + energy metrics     [optimisation_engine]
-    3. _cost_round_specs() / _run_merged_sweep()    sweep every (district, activity), rank vs BAU
-    4. write_results_workbook()                     write the ranking sheets                             [optimisation_engine]
+    1. build_lp()                                   assemble the LP for one (district, activity, heating) [optimisation_engine]
+    2. solve_scenario()                             solve and extract sizing + cost + energy metrics      [optimisation_engine]
+    3. _cost_round_specs() / _run_merged_sweep()    sweep every (district, activity), rank vs BAU         [optimisation_engine]
+    4. write_results_workbook()                     assemble workbook + charts     [optimisation_engine -> optimisation_report]
     5. main()                                       end-to-end run, timestamped output directory
 """
 
@@ -27,33 +26,18 @@ from datetime import datetime
 
 import pandas as pd
 from optimisation_config import DEFAULT_TIME_LIMIT_S
-
-# The model engine (PV/demand/COP/BAU physics, single-cell build+solve, sweep/pool mechanics).
 from optimisation_engine import (
-    price_scenarios, central_scenario, set_price_scenarios, _ensure_dm_initialized,
-    build_milp, solve_scenario, _make_solver, effective_import_limit_kw,
-    building_demand_kwh, building_heat_demand_kwh,
-    elec_growth_factors, heat_growth_factors,
-    rank_all_combinations, _run_merged_sweep, assemble_pareto, write_results_workbook,
-    _osm_survey_info,
+    COST_ROUNDS, scenarios_for_round, price_scenarios, _ensure_dm_initialized,
+    _run_merged_sweep, assemble_pareto, write_results_workbook, _osm_survey_info,
 )
-# Demand-side charts (re-exported by demand_profile_model from demand_report).
+# Demand-side charts
 from demand_profile_model import generate_all_demand_plots
 
 
-# Two-round cost optimisation:
-# Round 1 (deterministic): a single central price scenario.
-# Round 2 (stochastic):    the reduced weighted price-scenario set.
-COST_ROUNDS = ("deterministic", "stochastic")
-
-def _scenarios_for_round(name: str) -> list:
-    return [central_scenario()] if name == "deterministic" else price_scenarios()
-
 def _cost_round_specs(rounds: tuple = COST_ROUNDS) -> list:
-    # Build the _run_merged_sweep spec for the requested cost rounds.
     specs = []
     for name in rounds:
-        scen = _scenarios_for_round(name)
+        scen = scenarios_for_round(name)
         print(f"[cost · {name}] {len(scen)} price scenario(s) "
               f"({'no uncertainty' if name == 'deterministic' else 'import-price uncertainty'}) "
               f"across (district, activity, heating) …")
@@ -61,9 +45,21 @@ def _cost_round_specs(rounds: tuple = COST_ROUNDS) -> list:
     return specs
 
 
+def _read_grid_sensitivity(run_dir: str) -> pd.DataFrame:
+    # Reuse a completed run's grid-headroom bisection instead of re-solving it. 
+    wb = os.path.join(run_dir, "Optimisation Results (deterministic).xlsx")
+    if not os.path.exists(wb):
+        raise FileNotFoundError(f"No deterministic workbook in {run_dir} - nothing to reuse the "
+                                f"grid-headroom bisection from.")
+    if "Grid Sensitivity Data" not in pd.ExcelFile(wb).sheet_names:
+        raise ValueError(f"{os.path.basename(wb)} has no 'Grid Sensitivity Data' sheet - that run "
+                         f"was solved with --skip-grid-sensitivity, so there is nothing to reuse.")
+    df = pd.read_excel(wb, sheet_name="Grid Sensitivity Data")
+    return df.drop(columns=["edge_margin_label"], errors="ignore")
+
 
 def main(argv=None):
-    # CLI entry point; always a full run.
+    # Entry point - including argument parsing
     import argparse
     p = argparse.ArgumentParser(
         description="Two-stage stochastic optimisation of building PV/battery/heat sizing under "
@@ -73,18 +69,20 @@ def main(argv=None):
     p.add_argument("--time-limit", type=int, default=DEFAULT_TIME_LIMIT_S, dest="time_limit",
                    metavar="S", help=f"per-cell solver time limit in seconds (default: {DEFAULT_TIME_LIMIT_S})")
     p.add_argument("--jobs", type=int, default=None, metavar="N",
-                   help="parallel worker processes (default: CPU cores - 1; 1 = serial, easier to debug)")
+                   help="parallel worker processes (default: a quarter of the logical cores, the rest "
+                        "given to each worker as solver threads)")
     p.add_argument("--skip-stochastic", action="store_true",
-                   help="run the deterministic cost round only (single central price scenario), "
-                        "skipping the weighted import-price scenario set. Roughly halves the cost "
-                        "sweep; drops the det-vs-sto comparison CSV, the stochastic workbook, and "
-                        "the stochastic half of the policy rebates")
+                   help="run the deterministic cost round only")
+    p.add_argument("--skip-deterministic", action="store_true",
+                   help="run the stochastic cost round only.")
+    p.add_argument("--grid-sensitivity-from", metavar="RUN_DIR", default=None,
+                   dest="grid_sensitivity_from",
+                   help="reuse the grid-headroom bisection from a completed run instead of "
+                        "re-solving it, by reading the 'Grid Sensitivity Data' sheet of that run's "
+                        "deterministic workbook. Overrides --skip-grid-sensitivity")
     p.add_argument("--skip-policy", action="store_true",
                    help="skip the policy_recommendations.py lever back-calculation after the cost "
-                        "rounds: per activity class (4 of them, each at its own best-NPV district) "
-                        "5 bisections of ~7 re-solves plus a 21-step battery capex sweep, so ~285 "
-                        "solves per round. Measured ~3h45m for the stochastic round back when it "
-                        "was ~49 solves on one cell — budget most of a day per round now")
+                        "rounds: per activity class (4 of them, each at its own best-NPV district)")
     p.add_argument("--skip-grid-sensitivity", action="store_true",
                    help="skip the grid_sensitivity.py DNO ceiling / demand-margin bisection after "
                         "the cost rounds (one bisection per district x activity x heat-pump heating, "
@@ -100,13 +98,21 @@ def main(argv=None):
 
     _ensure_dm_initialized()
 
-    rounds = ("deterministic",) if args.skip_stochastic else COST_ROUNDS
-    # Headline round: the robust (stochastic) set when it was solved, else the deterministic one.
+    # One --skip-<round> flag per name in COST_ROUNDS.
+    rounds = tuple(n for n in COST_ROUNDS if not getattr(args, f"skip_{n}"))
+    if not rounds:
+        p.error("--skip-deterministic and --skip-stochastic together leave no cost round to solve.")
     headline = rounds[-1]
+    # The technology sensitivities and the grid bisection all pin stage-1 sizing from the
+    # deterministic round, so they can only run when it is in memory.
+    has_det = "deterministic" in rounds
 
     print("optimisation_model.py — two-stage stochastic optimisation (PV / battery / heat sizing)")
     if args.skip_stochastic:
         print("Cost rounds: deterministic only  (1 central scenario; --skip-stochastic).")
+    elif args.skip_deterministic:
+        print(f"Cost rounds: stochastic only  ({len(price_scenarios())} weighted import-price "
+              f"scenarios; --skip-deterministic).")
     else:
         print(f"Cost rounds: deterministic + stochastic  (deterministic = 1 central scenario; "
               f"stochastic = {len(price_scenarios())} weighted import-price scenarios).")
@@ -119,23 +125,16 @@ def main(argv=None):
     run_dir    = os.path.join("outputs", f"Optimisation ({_timestamp})")
     os.makedirs(run_dir, exist_ok=True)
 
-    # Demand charts first: they need no solve, take ~5 min against a multi-hour sweep, and every
-    # (district, activity) pair has its own profile — so the whole set is written, not one cell's.
-    # Running before the sweep means they survive an interrupted run.
     print("\nRendering demand profile charts (all districts × activity classes) …")
     generate_all_demand_plots(run_dir)
 
-    # Full run (both objectives) → NPV + Carbon + Pareto workbook.
+    # Full run (both objectives): NPV + Carbon + Pareto workbook.
     print(f"\nNPV + Carbon objectives — cost rounds ({' + '.join(rounds)}) and carbon sweep "
           "across (district, activity, heating) …")
     cost_specs = _cost_round_specs(rounds)
-    # One emissions sweep PER ROUND, each priced on that round's scenario set. The emissions
-    # objective never reads a price, so the design and its emissions come out identical either way —
-    # what changes is the cost reported alongside them. Solving it once on central prices left the
-    # stochastic workbook comparing 3-scenario costs against 1-scenario costs in assemble_pareto,
-    # which knocked genuinely cost-optimal designs off the front for no reason but the price basis.
+    # One emissions sweep per round, each priced on that round's scenario set. 
     emis_specs = [{"tag": f"emissions_{name}", "objective": "emissions",
-                   "scenarios": _scenarios_for_round(name),
+                   "scenarios": scenarios_for_round(name),
                    "sort_col": "emissions_saving_tco2e"} for name in rounds]
     specs = cost_specs + emis_specs
     merged = _run_merged_sweep(specs, **common)
@@ -146,22 +145,9 @@ def main(argv=None):
         cost_rounds[spec["tag"]] = df
     carbon_rounds = {name: merged[f"emissions_{name}"] for name in rounds}
     df_carbon = carbon_rounds[headline]
-    df_npv = cost_rounds[headline]   # robust set is the headline when it was solved
-    # No per-cell det-vs-sto comparison table is written. The two rounds do not share a price
-    # basis -- the stochastic scenario set is right-skewed, so its weighted mean import-price level
-    # is ~x1.31 against the deterministic x1.000 (see the Cover) -- and a side-by-side invites the
-    # cost gap to be read as a cost of ignoring uncertainty when it is mostly that level shift.
-    # The comparison that IS valid is stated in the write-up: first-stage sizing is identical in
-    # every cell bar sub-51 kWh moves in the thermal store, so the design is robust across the set.
+    df_npv = cost_rounds[headline]
     if not args.skip_policy:
         import policy_recommendations as polrec
-        # Every solved round: the HP rebate is the one output where the det/sto delta is substantive
-        # (heat pumps are the most import-price-exposed technology), so both are worth back-calculating.
-        # run_policy_recommendations keys its output frames by round name and re-derives each round's
-        # scenario set from that key, so passing cost_rounds straight through also honours
-        # --skip-stochastic. Every lever runs once per activity class (each in its own best-NPV
-        # district), so a round is ~104 tasks: 4 classes x (5 bisections + the 21-step battery capex
-        # sweep). n_jobs is capped at logical//4.
         print(f"\nBack-calculating policy levers per end-user type (battery + HP capex + HP "
               f"elec-price + export price + battery capex sweep, {' + '.join(rounds)}) …")
         polrec.run_policy_recommendations(
@@ -169,7 +155,6 @@ def main(argv=None):
             os.path.join(run_dir, "Policy Recommendations.xlsx"),
             time_limit_s=args.time_limit)
     # Technology sensitivities: fixed-sizing, dispatch-only re-solves off the deterministic round.
-    # Imported lazily — each pulls in optimisation_engine and builds a worker pool of its own.
     import ashp_grant_aerona3_sensitivity as ashpsens
     import pv_panel1_sensitivity as pvsens
     for skip, run_fn, label in (
@@ -177,18 +162,32 @@ def main(argv=None):
             (args.skip_pv_sensitivity, pvsens.run_pv_sensitivity, "Panel 1 PV")):
         if skip:
             continue
+        if not has_det:
+            print(f"\n(skipping {label} sensitivity - it pins sizing from the deterministic "
+                  f"round, which this run did not solve)")
+            continue
         print(f"\n{label} sensitivity (fixed sizing, dispatch-only re-solve, deterministic round) …")
         run_fn(cost_rounds["deterministic"], run_dir,
                time_limit_s=args.time_limit, n_jobs=args.jobs)
     df_grid_sens = pd.DataFrame()
-    if not args.skip_grid_sensitivity:
-        import grid_sensitivity as gridsens
-        print("\nBisecting grid-connection headroom (demand-growth margin / ceiling threshold, "
-              "deterministic scenario, heat-pump cells only) …")
-        df_grid_sens = gridsens.run_grid_sensitivity(
-            cost_rounds["deterministic"],
-            time_limit_s=args.time_limit)
-    # Objective 3 — NPV/carbon Pareto, assembled from the two completed sweeps.
+    if args.grid_sensitivity_from:
+        df_grid_sens = _read_grid_sensitivity(args.grid_sensitivity_from)
+        print(f"\nReusing the grid-connection headroom bisection from "
+              f"{args.grid_sensitivity_from} ({len(df_grid_sens)} cells) - not re-solving it.")
+    elif not args.skip_grid_sensitivity:
+        if not has_det:
+            print("\n(skipping the grid-headroom bisection - it pins sizing from the "
+                  "deterministic round, which this run did not solve. Pass "
+                  "--grid-sensitivity-from RUN_DIR to carry a completed run's "
+                  "'Grid Sensitivity Data' sheet into this workbook instead)")
+        else:
+            import grid_sensitivity as gridsens
+            print("\nBisecting grid-connection headroom (demand-growth margin / ceiling threshold, "
+                  "deterministic scenario, heat-pump cells only) …")
+            df_grid_sens = gridsens.run_grid_sensitivity(
+                cost_rounds["deterministic"],
+                time_limit_s=args.time_limit)
+    # Objective 3: NPV/carbon Pareto, assembled from the two completed sweeps.
     df_pareto = assemble_pareto(df_npv, df_carbon)
 
     # Rank only proven-optimal designs.
@@ -201,8 +200,6 @@ def main(argv=None):
               f"{n_drop_car} carbon cells)")
 
     for name, df_cost in cost_rounds.items():
-        # Both sheets of a workbook now come from the same price basis, so the Pareto dominance
-        # test compares like with like.
         df_carb_r = carbon_rounds[name]
         dfp = df_pareto if name == headline else assemble_pareto(df_cost, df_carb_r)
         out = os.path.join(run_dir, f"Optimisation Results ({name}).xlsx")
@@ -210,7 +207,7 @@ def main(argv=None):
         sheets = {"NPV": df_cost, "Carbon": df_carb_r, "Pareto": dfp}
         write_results_workbook(sheets, out,
                                run_meta={"timestamp": _timestamp, "round": name},
-                               scenarios=_scenarios_for_round(name),
+                               scenarios=scenarios_for_round(name),
                                grid_sensitivity=df_grid_sens)
 
 

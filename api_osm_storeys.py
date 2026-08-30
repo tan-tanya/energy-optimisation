@@ -33,6 +33,8 @@ import time
 import math
 import requests
 import pandas as pd
+
+import datasets   # footprint-band definition, shared with the optimisation model
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -48,11 +50,12 @@ BACKOFF_BASE  = 10    # seconds; doubles each retry
 PAUSE_BETWEEN = 8     # seconds interval between successful queries 
 
 HEADERS    = {"User-Agent": "research-storey-survey/1.0 (academic use)"}
-OUTPUT_XLSX   = os.path.join("data", "api_osm_storeys.xlsx")          # consumed by optimisation_model (an input, so it lives in data/)
-RAW_CSV       = os.path.join("cache", "osm_storeys_raw.csv")     # checkpoint: storey pull (resumable scratch)
-ROOFSHAPE_CSV = os.path.join("cache", "osm_roofshape_raw.csv")  # checkpoint: roof:shape pull (resumable scratch)
+OUTPUT_XLSX   = os.path.join("data", "api_osm_storeys.xlsx")        # to be consumed by optimisation_model 
+RAW_CSV       = os.path.join("cache", "osm_storeys_raw.csv")        # storey pull (resumable scratch)
+ROOFSHAPE_CSV = os.path.join("cache", "osm_roofshape_raw.csv")      # roof:shape pull (resumable scratch)
 
-# Representative-station cities, per DISTRICT_STATIONS in demand_profile_model.py). bbox = (south, west, north, east).
+# Representative-station cities, one per Met Office district in districts.py. bbox = (south, west, north, east).
+# NOTE: Scotland W surveys Glasgow rather than the district's Prestwick station, for sample size.
 STATIONS = {
     "East Anglia":              ("Norwich",    (52.58,  1.21, 52.68,  1.36)),
     "England E and NE":         ("Newcastle",  (54.94, -1.72, 55.03, -1.50)),
@@ -76,7 +79,7 @@ ACTIVITY_FILTERS = {
 # Activity order for the summary sheet.
 ACTIVITY_ORDER = list(ACTIVITY_FILTERS.keys())
 
-# Tag keys used to describe what an element is (for the "Type Tags" provenance column).
+# Tag keys (for the "Type Tags" column).
 DESCRIPTOR_KEYS = ("building", "amenity", "office", "shop", "healthcare")
 
 # 2 - QUERY SETUP
@@ -100,12 +103,12 @@ def fetch(query):
                 print(f"    [{host}] HTTP {r.status_code}; retry in {wait}s")
                 time.sleep(wait)
                 continue
-            r.raise_for_status()  # surface other errors (real bugs)
+            r.raise_for_status()  # surface other errors 
         print(f"    [{host}] exhausted retries; trying next mirror")
     raise RuntimeError("All Overpass endpoints failed after retries")
 
 def build_query(bbox, filters, key="building:levels", out="tags"):
-    # Union of way+relation elements carrying `key` and matching any of the activity `filters`.
+    # Union of elements carrying `key` and matching any of the activity `filters`.
     s, w, n, e = bbox
     b = f"({s},{w},{n},{e})"
     parts = []
@@ -119,13 +122,13 @@ def parse_storeys(raw):
     if raw is None:
         return None
     try:
-        val = float(str(raw).split(";")[0].strip())  # handle "2;3" -> 2
+        val = float(str(raw).split(";")[0].strip())   # handle "2;3" -> 2
     except ValueError:
         return None
     return val if 0 < val <= 100 else None            # drop junk values
 
 def descriptor(tags):
-    """Compact 'key=value; ...' string of the identifying tags, for provenance."""
+    """Compact 'key=value; ...' string of the identifying tags."""
     return "; ".join(f"{k}={tags[k]}" for k in DESCRIPTOR_KEYS if k in tags)
 
 def collect_rows():
@@ -190,7 +193,7 @@ def _ring_area_m2(coords):
     return abs(s) / 2.0
 
 def footprint_m2(el):
-    """Building footprint area (m²) from an Overpass `out geom` element."""
+    """Building footprint area (m2) from an Overpass element."""
     t = el.get("type")
     if t == "way":
         geom = el.get("geometry") or []
@@ -207,7 +210,7 @@ def footprint_m2(el):
     return 0.0
 
 def collect_roof_rows():
-    """Query roof:shape (with geometry) per (activity x station); one row per tagged building."""
+    """Query roof:shape per (activity x station); one row per tagged building."""
     rows = []
     for activity, filters in ACTIVITY_FILTERS.items():
         for district, (city, bbox) in STATIONS.items():
@@ -245,7 +248,7 @@ COLUMN_ORDER = [
 
 def prepare(df):
     """OSM `building:levels` is defined as a positive integer; fractions typically represent partial floors. 
-    Exact values are kept in `Storeys (raw)` and rounded to the nearest integer for the statistics. 
+    Exact values are kept in `Storeys (raw)` and rounded to the nearest integer. 
     Also handles older cache files that stored the raw value under `Storeys`."""
     if "Storeys (raw)" not in df.columns and "Storeys" in df.columns:
         df = df.rename(columns={"Storeys": "Storeys (raw)"})        # identify cache files
@@ -275,9 +278,10 @@ ROOF_COLUMN_ORDER = [
     "Building Name", "Roof Shape", "Roof Angle", "Footprint m2", "Type Tags", "OSM URL",
 ]
 
-# Footprint-size bands (m²) for the flat-by-size analysis.
-FOOTPRINT_BINS   = [0, 250, 1000, 5000, float("inf")]
-FOOTPRINT_LABELS = ["<250", "250-1,000", "1,000-5,000", ">=5,000"]
+# Footprint-size bands (m2) to evaluate proportion of flat roofs per building size.
+# Single source of truth, shared with optimisation_engine (which reads these bands back).
+FOOTPRINT_BINS   = datasets.FOOTPRINT_BINS
+FOOTPRINT_LABELS = datasets.FOOTPRINT_LABELS
 
 def prepare_roof(df):
     """Restore blank text cells (CSV NaN -> ''), order columns, and sort."""
@@ -304,7 +308,7 @@ def summarise_roof_shape(raw_df):
     aw = (g["flat_area"].sum() / g["Footprint m2"].sum() * 100).round(1)
     ct["Flat % (area-wtd)"] = aw
 
-    # roof:angle is sparse — report it separately
+    # roof:angle is sparse; report it separately.
     ang = raw_df.dropna(subset=["Roof Angle"]).groupby("Activity Class")["Roof Angle"]
     ct["n (angle)"]    = ang.count()
     ct["Median angle"] = ang.median().round(1)
@@ -364,7 +368,6 @@ def main():
     summary_df = summarise(raw_df)
 
     # Roof-shape survey (roof:shape / roof:angle + footprint) — tests the flat-roof assumption.
-    # Requires "Footprint m2"; an older tags-only cache without it triggers an automatic re-pull.
     roof_df         = prepare_roof(_load_or_collect(ROOFSHAPE_CSV, collect_roof_rows,
                                                     "roof-shape data", required_cols=("Footprint m2",)))
     roof_summary_df = summarise_roof_shape(roof_df)

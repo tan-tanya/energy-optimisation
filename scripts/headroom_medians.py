@@ -30,11 +30,36 @@ Interpretation: the ceiling represents a typical *connectable* primary in the li
 an already-saturated primary are out of scope of a district-level average either way — the model has
 no substation-level siting dimension to represent them.
 
+POOLING ACROSS LICENCE AREAS
+Two Met Office districts straddle two DNOs, and for those the estimator pools the primaries of both
+licence areas into one sample rather than picking a winner:
+
+    England NW and N Wales     ENWL + SP Manweb
+    England SE and Central S   UKPN (LPN+SPN) + SSEN SEPD
+
+England SE and Central S was originally UKPN-only, because the headroom extracts were collected one
+file per DNO and the UKPN file was tagged to this district by its filename. The SEPD half of the
+district was in fact already present in the SSEN dashboard extract (filed under Scotland N, which is
+the SHEPD half of the same download) and was simply never selected. Pooling it in brings the district
+into line with how England NW and N Wales is treated and with the two-DNO listing in the thesis.
+Effect: import 10920 -> 8960 kW, export 33490 -> 33595 kW. Neither ceiling binds any cell in the
+sweep, so this moves the reported demand-growth margins for that district and nothing else.
+
+Caveat on the pooled SEPD sample: 44% of its primaries sit at zero demand headroom and 90% at zero
+generation headroom, so the export contribution rests on 44 non-zero substations. The median-of-non-
+zero estimator is what makes that tolerable — see WHAT CHANGED above.
+
+England NW and N Wales still takes export from ENWL alone. Every SP Manweb generation row in that
+extract is exactly zero, so the non-zero filter discards all of them and pooling would return the
+identical 25850 kW; the asymmetry is cosmetic under this estimator, not a second rule.
+
 VALIDATION
 --verify re-runs the ORIGINAL plain-median estimator and checks it still reproduces the legacy
-values below. This is what pins the filter/column choices to the numbers actually in the workbook:
-all 16 distinct legacy values reproduce exactly. Run it after any refresh of data/headroom/ — a
-failure means the upstream extract changed shape, not that the new estimator is wrong.
+values below. This is what pins the filter/column choices to the numbers actually in the workbook.
+Run it after any refresh of data/headroom/ — a failure means the upstream extract changed shape, not
+that the new estimator is wrong. The two England SE and Central S entries were RE-PINNED when SEPD
+was pooled in (their pre-SEPD UKPN-only plain medians were 10330 and 30940); the other 14 still carry
+their original hand-computed values and reproduce exactly.
 
 USAGE
     python scripts/headroom_medians.py            # print the comparison table
@@ -125,9 +150,11 @@ def _spd(htype):
     return _num(df.loc[m, "Headroom (MW)"]) * 1000.0
 
 
-def _ssen(col):
+def _ssen(col, area="Scotland / SHEPD"):
+    # The one SSEN dashboard extract carries both licence areas: SHEPD (Scotland N) and SEPD, which
+    # is the second DNO of England SE and Central S alongside UKPN.
     df = _load(SSEN)
-    s = df[(df["Map / License Area"] == "Scotland / SHEPD") & (df["Substation Type"] == "Primary")]
+    s = df[(df["Map / License Area"] == area) & (df["Substation Type"] == "Primary")]
     return _num(s[col]) * 1000.0
 
 
@@ -149,10 +176,16 @@ SPECS = {
          "ENWL NDP + SPEN SPM NSHR pooled"),
     ("England NW and N Wales", "export"):
         (lambda: _enwl(ENWL_G, "PRY GEN HEADROOM - INVERTER BASED ( MW )"), 25700, "ENWL NDP only"),
+    # Two licence areas, pooled in both directions (see POOLING note in the docstring). Legacy values
+    # here are RE-PINNED to the pooled plain median; the pre-SEPD UKPN-only figures were 10330/30940.
     ("England SE and Central S", "import"):
-        (lambda: _ukpn(_SEC, "Demand Headroom"), 10330, "UKPN DFES NSHR (LPN+SPN)"),
+        (lambda: pd.concat([_ukpn(_SEC, "Demand Headroom"),
+                            _ssen("Estimated Demand Headroom (MVA)", "England / SEPD")]), 6070,
+         "UKPN DFES NSHR (LPN+SPN) + SSEN SEPD dashboard pooled"),
     ("England SE and Central S", "export"):
-        (lambda: _ukpn(_SEC, "Gen inverter headroom"), 30940, "UKPN DFES NSHR (LPN+SPN)"),
+        (lambda: pd.concat([_ukpn(_SEC, "Gen inverter headroom"),
+                            _ssen("Estimated Generation Headroom (MW)", "England / SEPD")]), 1610,
+         "UKPN DFES NSHR (LPN+SPN) + SSEN SEPD dashboard pooled"),
     ("England SW and S Wales", "import"):
         (lambda: _nged(["South West", "South Wales"], "demandConnectedHeadroomMW"), 5150,
          "NGED Network Capacity Map"),

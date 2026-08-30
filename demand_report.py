@@ -1,10 +1,7 @@
 """
-Import-only.
+Import-only. Rendering layer for demand_profile_model - builds Excel sheets and demand plots. 
 
-Rendering layer for demand_profile_model (builds Excel sheets and demand plots. 
-
-Imported by demand_profile_model (which re-exports build_benchmark_sheet / build_demand_sheet /
-generate_demand_plots / generate_all_demand_plots) and notebooks/demand.
+Imported by demand_profile_model (build_*_sheet) and by optimisation_model (the demand chart set).
 
 generate_demand_plots() renders one district; generate_all_demand_plots() renders every district
 into a single `demand/` folder and is what both demand_profile_model.main() and
@@ -25,7 +22,7 @@ from demand_profile_model import (
     peak_scale_factor, half_hourly_kw_per_sqm, annual_demand_kwh,
     seasonal_demand_kwh, sample_buildings,
     HEATING_OPTIONS, HEATING_SYSTEMS, SEASON_ORDER_BENCHMARK, SEASON_ORDER_DEMAND,
-    MONTHS_ORDER, MONTH_SEASON, WE_LOAD_FACTOR, OUTPUTS_DIR,
+    MONTHS_ORDER, MONTH_SEASON, OUTPUTS_DIR,
 )
 
 
@@ -213,9 +210,9 @@ def _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, subdir, label, dist
     for heating, etype in PLOT_COMBINATIONS:
         all_z = {}
         for act in acts:
-            we_factor = WE_LOAD_FACTOR[act]
-            wd_fac    = 7.0 / (5.0 + 2.0 * we_factor)
-            z_rows    = []
+            # Same WD/WE split the optimiser uses (dm.wd_we_factors is the single source).
+            wd_fac, we_fac = dpm.wd_we_factors(act)
+            z_rows = []
             for m in MONTHS_ORDER:
                 parent  = MONTH_SEASON[m]
                 profile = half_hourly_kw_per_sqm(
@@ -224,7 +221,7 @@ def _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, subdir, label, dist
                 )
                 hourly_kwh = _to_hourly_kwh(profile, act)
                 z_rows.append(hourly_kwh * wd_fac)
-                z_rows.append(hourly_kwh * wd_fac * we_factor)
+                z_rows.append(hourly_kwh * we_fac)
             all_z[act] = np.array(z_rows)  # (24, 24)
 
         vmax  = max(z.max() for z in all_z.values())
@@ -263,8 +260,7 @@ def _render_wd_we_heatmap(activities, monthly_dd, daily_hdd, subdir, label, dist
 
 def generate_demand_plots(degree_days: dict, daily_hdd: float, label: str, monthly_dd: dict = None, activities: list = None,
                           out_dir: str = OUTPUTS_DIR, district: str = None, file_prefix: str = ""):
-    """Every chart for ONE district. `file_prefix` is prepended to each filename so several
-    districts can share one output folder without overwriting each other."""
+    """One chart for each district."""
     os.makedirs(out_dir, exist_ok=True)
 
     def seasonal_profile(act, heating, etype, season):
@@ -292,14 +288,7 @@ def _slug(s: str) -> str:
 
 
 def generate_all_demand_plots(out_dir: str, districts: list = None, activities: list = None) -> str:
-    """Render the complete demand chart set into a single `demand/` folder under out_dir.
-
-    A separate profile is generated for every (district, activity class) pair, so no one chart
-    can stand in for the sweep — this writes them all. Per district: seasonal and monthly daily
-    profiles plus the monthly WD/WE heatmap, each in the five (heating system, energy type)
-    combinations that carry load, with all activity classes drawn on the same axes. Filenames are
-    district-prefixed so the flat folder stays collision-free.
-    """
+    """Render the complete demand chart set into a single `demand/` folder under out_dir."""
     if dpm.degree_days_by_district is None:
         dpm.initialize()
     demand_dir = os.path.join(out_dir, "demand")

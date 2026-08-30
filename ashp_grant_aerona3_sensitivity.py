@@ -1,40 +1,22 @@
-"""ASHP technology sensitivity. Runs as part of the pipeline (optimisation_model.main() calls
-run_ashp_sensitivity() after the cost rounds; --skip-ashp-sensitivity to opt out), and also
-standalone against the most recent completed run:
+"""ASHP technology sensitivity. 
+Runs as part of the pipeline (optimisation_model.main() calls run_ashp_sensitivity() after the cost rounds),
+or standalone against the most recent completed run:
     python ashp_grant_aerona3_sensitivity.py [--limit N] [--time-limit S] [--jobs N]
+Note: Running standalone against an earlier run predating a sizing bound change makes every row infeasible. 
 
-Prefer the in-pipeline path. This is a FIXED-SIZING re-solve: it pins n_pv to the saved design, so
-running it standalone against a run that predates any change to the roof-area cap (or another
-sizing bound) makes every row infeasible. That is exactly what blocked it between 2026-07-23 and
-2026-07-27 — all 35 ASHP rows of the then-latest run had a saved n_pv above the current
-n_pv_max_for_activity. Driving it from the run that just finished removes the failure mode.
+Compares the model's current ASHP COP against a real UK product -- the Grant Aerona3 R32 (COP @ A7/W55 = 2.66) 
+-- for every ASHP design in the latest deterministic cost-round optimisation run.
 
-Compares the model's current ASHP COP (CEP Technology Library v1.02, Company 4 R-32 average,
-ashp_cop_at_7C=2.7283) against a real market "value" UK product -- the Grant Aerona3 R32
-(COP @ A7/W55 = 2.66, per manufacturer's EN14511 datasheet) -- for every ASHP design in the
-LATEST deterministic cost-round optimisation run (most-recently-modified outputs/Optimisation (*)
-folder).
-
-Method: mirrors pv_panel1_sensitivity.py's fixed-sizing, dispatch-only re-solve. For each
-(district, activity) design where ASHP is the winning heating system, first-stage sizing (n_pv,
-e_batt, o_batt, q_heat_cap, e_th) is fixed at the saved deterministic-round solution and only the
-stage-2 dispatch is re-solved with:
+Method: 
+For each (district, activity) design where ASHP is the winning heating system, first-stage sizing (n_pv, e_batt, 
+o_batt, q_heat_cap, e_th) is fixed at the saved deterministic solution. Only the stage-2 dispatch is re-solved with:
   - ashp_cop_at_7C lowered to Grant Aerona3's 2.66 (COP/temperature SLOPE held at the model's
-    existing value, per direction -- no published multi-temperature curve was found for Grant
-    Aerona3 in public datasheets [manufacturers only publish the two single-point EN14511 ratings,
-    A7/W35 and A7/W55, required for ErP labelling], so the reduction is applied only at the
-    reference point; cold-weather sensitivity is assumed identical to the current model).
-  - HEAT_COSTS["ASHP"]["capex_per_kwth"] cut by CAPEX_REDUCTION_FRAC, paired with the COP cut
-    (2.66 / 2.7283 - 1 = -2.5%; CAPEX_REDUCTION_FRAC set to the requested -2.6%).
-Baseline (current-COP) metrics are read straight from the deterministic sweep rows rather than
-re-solved -- same
-validated shortcut as pv_panel1_sensitivity.py (fixed sizing + dispatch-only re-solve reproduces a
-fresh full re-solve's total_cost_npv_GBP to within a rounding error, confirmed for the PV case on
-2026-07-08; the mechanism is identical here, only the perturbed technology differs).
+    existing value; cold-weather sensitivity assumed identical to the current model).
+  - HEAT_COSTS["ASHP"]["capex_per_kwth"] cut by CAPEX_REDUCTION_FRAC, paired with the COP cut (~2.5%).
+Baseline (current-COP) metrics are read straight from the deterministic sweep rows rather than re-solved.
 
-Output: <run folder>/ashp_grant_aerona3_sensitivity.xlsx, one row per ASHP design, in the same
-NPV-savings-ranked row order as the source deterministic sweep (the "NPV Data" sheet of
-Optimisation Results (deterministic).xlsx).
+Output: <run folder>/ashp_grant_aerona3_sensitivity.xlsx, one row per ASHP design, 
+in the same NPV-savings-ranked row order as the source deterministic sweep.
 """
 import argparse
 import glob
@@ -48,12 +30,12 @@ from openpyxl.utils import get_column_letter
 
 import demand_profile_model as dm
 import optimisation_engine as oe
+from optimisation_config import resolve_jobs
 
-# Grant Aerona3 R32, COP @ A7/W55 (manufacturer EN14511 datasheet) vs the model's current
-# Company-4-R32-average (CEP Technology Library v1.02, HP air-water (Heating) sheet, units 12-17).
+# Grant Aerona3 R32 vs the model's current Company-4-R32-average.
 CURRENT_ASHP_COP_AT_7C = 2.7283
 GRANT_COP_AT_7C        = 2.66
-CAPEX_REDUCTION_FRAC   = 0.026   # paired capex cut, matching the ~2.5% COP drop (user-specified)
+CAPEX_REDUCTION_FRAC   = 0.026   # paired capex cut, set alongside the 2.50% COP drop (2.66/2.7283)
 
 RESULT_COLS = ["status", "q_heat_cap_kwth", "annual_import_kwh", "annual_export_kwh",
                "capex_GBP", "opex_npv_GBP", "total_cost_npv_GBP", "npv_savings_GBP",
@@ -108,19 +90,15 @@ def _latest_run_dir() -> str:
 
 
 def _read_deterministic_rows(run_dir: str) -> pd.DataFrame:
-    # The deterministic sweep rows, straight off the workbook the pipeline writes at the end of a
-    # run — the same frame run_ashp_sensitivity() is handed in-process. Only the standalone entry
-    # point needs this; a run interrupted before its workbooks were written has nothing to re-read.
+    # The deterministic sweep rows from the workbook written at the end of a run.
     wb = os.path.join(run_dir, "Optimisation Results (deterministic).xlsx")
     if not os.path.exists(wb):
-        raise FileNotFoundError(f"No deterministic workbook in {run_dir} — the run did not get as "
-                                f"far as writing its workbooks, so there are no rows to re-use.")
+        raise FileNotFoundError(f"No deterministic workbook in {run_dir}.")
     return pd.read_excel(wb, sheet_name="NPV Data")
 
 
 def _pool_init():
-    # Runs once per worker process. Every task this pool ever runs is a Grant-Aerona3 solve, so the
-    # ASHP tech-param swap happens once here rather than per task.
+    # Runs once per worker process.
     dm.initialize()
     dm.ashp_cop_at_7C = GRANT_COP_AT_7C   # slope (dm.ashp_cop_slope_per_C) left untouched, per direction
     base_capex = oe.HEAT_COSTS["ASHP"]["capex_per_kwth"]
@@ -129,15 +107,12 @@ def _pool_init():
 
 def _solve_one(task: tuple) -> dict:
     district, activity, n_pv, e_batt, o_batt, q_heat_cap, e_th, threads, time_limit_s = task
-    prob, V = oe.build_milp(district, activity, "ASHP",
+    prob, V = oe.build_lp(district, activity, "ASHP",
                             objective="cost", scenarios=[oe.central_scenario()])
     prob += V["n_pv"]       == n_pv,       "fix_n_pv"
     prob += V["e_batt"]     == e_batt,     "fix_e_batt"
     prob += V["o_batt"]     == o_batt,     "fix_o_batt"
-    # Floors, not equalities -- same rationale as pv_panel1_sensitivity.py: the saved rows round
-    # both to 1 dp, and thermal capacity is unaffected by the COP change (COP only changes the
-    # electrical input needed for a given thermal output), so pinning it exactly risks a spurious
-    # infeasibility from rounding rather than reflecting anything about Grant Aerona3 itself.
+    # Flooring instead of equalities to prevent infeasibility due to rounding.
     prob += V["q_heat_cap"] >= q_heat_cap, "floor_q_heat_cap"
     prob += V["e_th"]       >= e_th,       "floor_e_th"
     solver = oe._make_solver(solver_msg=False, time_limit_s=time_limit_s, threads=threads)
@@ -149,15 +124,9 @@ def _solve_one(task: tuple) -> dict:
 
 def run_ashp_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: int = 600,
                          n_jobs: int = None, limit: int = None) -> pd.DataFrame:
-    """Library entry point — called by optimisation_model.main() with the fresh deterministic
-    cost-round DataFrame, and by this module's own CLI with the same frame read back from the
-    "NPV Data" sheet of the deterministic workbook.
-
-    Passing the in-memory frame is what makes this safe to run in-pipeline: the fixed-sizing
-    re-solve pins n_pv to the saved design, so a saved run that predates a change to the roof-area
-    cap (or any other sizing bound) goes infeasible on every row. Sourcing the sizing from the run
-    that just completed removes that failure mode by construction — see the staleness note in the
-    module docstring.
+    """Called by optimisation_model.main() with the fresh deterministic cost-round DataFrame, 
+    and by this module's own CLI with the same frame read back from the deterministic "NPV Data" sheet.
+    Passing the in-memory frame makes this safe to run in-pipeline.
     """
     print(f"Grant Aerona3 COP@7C={GRANT_COP_AT_7C} vs current {CURRENT_ASHP_COP_AT_7C} "
           f"({(GRANT_COP_AT_7C / CURRENT_ASHP_COP_AT_7C - 1) * 100:+.2f}%); "
@@ -173,12 +142,8 @@ def run_ashp_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: 
     print(f"{len(base)} ASHP designs Optimal (of {len(all_rows)} total rows) -- "
           f"solving Grant Aerona3 dispatch for each")
 
-    logical = os.cpu_count() or 2
-    # Physical-core parallelism, matching the rest of the pipeline (see the solver-contention note
-    # in optimisation_config): independent large LPs contend for cache/memory bandwidth badly enough
-    # to false-fail clean cells if workers x threads is pushed to the logical-core count.
-    n_jobs = max(1, n_jobs or logical // 4)
-    threads_per_worker = max(1, logical // n_jobs)
+    # Same worker/thread sizing rule as the rest of the pipeline.
+    n_jobs, threads_per_worker = resolve_jobs(n_jobs, len(base))
 
     tasks = [(r.district, r.activity, r.n_pv, r.e_batt_kwh, r.o_batt_kw,
               r.q_heat_cap_kwth, r.e_th_kwh, threads_per_worker, time_limit_s)
@@ -205,9 +170,8 @@ def run_ashp_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: 
     out["opex_npv_GBP_delta"]             = out["grant_opex_npv_GBP"] - out["base_opex_npv_GBP"]
     out["total_cost_npv_GBP_delta"]       = out["grant_total_cost_npv_GBP"] - out["base_total_cost_npv_GBP"]
     out["lifetime_emissions_tco2e_delta"] = out["grant_lifetime_emissions_tco2e"] - out["base_lifetime_emissions_tco2e"]
-    # NA (not False) when Grant Aerona3's fixed-sizing dispatch is Infeasible -- distinct from
-    # "solved but costs more". Infeasible would mean the lower COP pushes required grid import over
-    # the district's DNO connection limit at the frozen sizing.
+    # NA (not False) when Grant Aerona3's fixed-sizing dispatch is Infeasible
+    # (the lower COP pushes required grid import over the DNO limit)
     is_optimal = out["grant_status"] == "Optimal"
     out["cheap_ashp_pays_off"] = pd.Series(pd.NA, index=out.index, dtype="boolean")
     out.loc[is_optimal, "cheap_ashp_pays_off"] = out.loc[is_optimal, "total_cost_npv_GBP_delta"] < 0
@@ -223,15 +187,13 @@ def run_ashp_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: 
                 run_dir,
                 f"{CURRENT_ASHP_COP_AT_7C} (CEP Technology Library v1.02, Company 4 R-32 average, units 12-17)",
                 f"{GRANT_COP_AT_7C} (manufacturer EN14511 datasheet)",
-                "Unchanged from the current model -- no published multi-temperature curve found "
-                "for Grant Aerona3 in public datasheets, so cold-weather sensitivity is assumed "
-                "identical; only the reference-point COP is lowered.",
+                "Unchanged from the current model -- no published multi-temperature curve for Grant Aerona3,"
+                "so cold-weather sensitivity is assumed identical; only the reference-point COP is lowered.",
                 f"{CAPEX_REDUCTION_FRAC * 100:.1f}% cut to HEAT_COSTS['ASHP']['capex_per_kwth'], "
-                f"paired with the COP drop (COP itself falls {(GRANT_COP_AT_7C / CURRENT_ASHP_COP_AT_7C - 1) * 100:.2f}%).",
+                f"paired with the COP drop.",
                 "First-stage sizing (n_pv, e_batt, o_batt, q_heat_cap, e_th) fixed at the saved "
                 "deterministic-round solution; only stage-2 dispatch is re-solved with Grant "
-                "Aerona3's COP/capex swapped in. Baseline (base_*) columns are the saved CSV "
-                "values, not re-solved. Applies only to designs where ASHP is the heating system.",
+                "Aerona3's COP/capex swapped in. Applies only to ASHP designs.",
             ],
         })
         notes.to_excel(xw, sheet_name="Assumptions", index=False)
@@ -249,13 +211,14 @@ def run_ashp_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: 
 def main():
     ap = argparse.ArgumentParser(description="Standalone re-run against an already-completed "
                                              "optimisation run. The pipeline calls "
-                                             "run_ashp_sensitivity() directly instead.")
+                                             "run_ashp_sensitivity() directly.")
     ap.add_argument("--limit", type=int, default=None,
                     help="Only solve the first N designs (for a quick test run).")
     ap.add_argument("--time-limit", type=int, default=600, dest="time_limit", metavar="S",
                     help="per-design solver time limit in seconds (default: 600)")
     ap.add_argument("--jobs", type=int, default=None, metavar="N",
-                    help="parallel worker processes (default: logical cores // 4)")
+                    help="parallel worker processes (default: a quarter of the logical cores; "
+                         "see optimisation_config.resolve_jobs)")
     args = ap.parse_args()
 
     run_dir = _latest_run_dir()

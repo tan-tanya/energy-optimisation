@@ -1,5 +1,5 @@
 """
-Grid electricity import-price uncertainty for the TSSP.
+Import-only. Grid electricity import-price uncertainty for the TSSP.
 
 Generates a weighted set of representative 15-year electricity IMPORT-price scenarios that drive the
 TSSP second stage (recourse dispatch). Uncertainty is sampled over two facets:
@@ -10,7 +10,7 @@ Each draw maps to a 15-year multiplier path
 applied on top of the year-0 size-band CENTRAL import price the deterministic model already selects.
 
 Method (literature: Latin Hypercube Sampling -> scenario reduction by clustering):
-  - 2-D LHS (scipy.stats.qmc.LatinHypercube) with TRIANGULAR marginals (each band's min/mode/max).
+  - 2-D LHS (scipy.stats.qmc.LatinHypercube) using triangular marginals (each band's min/mode/max).
   - k-medoid reduction of sampled paths to k weighted representatives.
 """
 
@@ -21,25 +21,23 @@ import pandas as pd
 from scipy.stats import qmc, triang
 
 from model_params import IMPORT_PRICE_SCENARIOS, ENERGY_GROWTH_SCENARIOS
+from optimisation_config import HORIZON_YEARS   # single source of truth for the horizon
 
-HORIZON_YEARS = 15
-
-# Default sampling knobs — N draws reduced to k weighted scenarios.
+# Default sampling settings
 DEFAULT_N_SAMPLES = 1000
-DEFAULT_N_REDUCED = 3      # reduced scenario count (k); 3 keeps the spread while ~40% smaller than 5
+DEFAULT_N_REDUCED = 3      # reduced scenario count (k)
 DEFAULT_SEED      = 0
 
 
 # 1 - DEFINITION 
 def _triangular_params(low: float, mode: float, high: float) -> dict:
-    # scipy.stats.triang is parameterised by c=(mode-loc)/scale, loc=min, scale=(max-min).
     span = high - low
     if span <= 0:
         raise ValueError(f"degenerate triangular band: low={low}, mode={mode}, high={high}")
     return {"c": (mode - low) / span, "loc": low, "scale": span}
 
 def level_band() -> tuple:
-    # (low, central, high) electricity import-price LEVEL multipliers, relative to Central.
+    # (low, central, high) electricity import-price level multipliers, relative to Central.
     s = IMPORT_PRICE_SCENARIOS
     return (s["Low"]["elec_import_multiplier"],
             s["Central"]["elec_import_multiplier"],
@@ -59,35 +57,19 @@ def price_multiplier_path(level: float, growth: float, horizon: int = HORIZON_YE
     return level * (1.0 + growth) ** y
 
 
-# 2 - LHS of (level, growth)
+# 2 - SAMPLING of (level, growth)
 def lhs_samples(n: int = DEFAULT_N_SAMPLES, seed: int = DEFAULT_SEED) -> np.ndarray:
-    # n x 2 array of (level, growth) drawn by 2-D LHS through the triangular inverse-CDFs.
-    lo_l, mo_l, hi_l = level_band()
-    lo_g, mo_g, hi_g = growth_band()
-    pl = _triangular_params(lo_l, mo_l, hi_l)
-    pg = _triangular_params(lo_g, mo_g, hi_g)
-
-    u = qmc.LatinHypercube(d=2, seed=seed).random(n)        
-    level  = triang.ppf(u[:, 0], **pl)
-    growth = triang.ppf(u[:, 1], **pg)
-    return np.column_stack([level, growth])
-
-def mc_samples(n: int = DEFAULT_N_SAMPLES, seed: int = DEFAULT_SEED) -> np.ndarray:
-    # Plain Monte Carlo draw of (level, growth) — for the LHS-vs-MC coverage comparison only.
-    rng = np.random.default_rng(seed)
-    lo_l, mo_l, hi_l = level_band()
-    lo_g, mo_g, hi_g = growth_band()
-    pl = _triangular_params(lo_l, mo_l, hi_l)
-    pg = _triangular_params(lo_g, mo_g, hi_g)
-    level  = triang.ppf(rng.random(n), **pl)
-    growth = triang.ppf(rng.random(n), **pg)
-    return np.column_stack([level, growth])
+    # n x 2 array of (level, growth), stratified by LHS.
+    unit_draws = qmc.LatinHypercube(d=2, seed=seed).random(n)
+    pl = _triangular_params(*level_band())
+    pg = _triangular_params(*growth_band())
+    return np.column_stack([triang.ppf(unit_draws[:, 0], **pl),
+                            triang.ppf(unit_draws[:, 1], **pg)])
 
 
 # 3 - SCENARIO REDUCTION
 def reduce_scenarios(paths: np.ndarray, k: int, seed: int = DEFAULT_SEED) -> tuple:
-    # Cluster the N x horizon path matrix into <= k groups (Euclidean k-means on the path vectors),
-    # then pick each cluster's MEDOID (sample nearest its centroid) as the representative.
+    # Cluster the N x horizon path matrix into <= k groups, then pick each cluster's sample nearest its centroid.
     # Returns (medoid_row_indices, weights) with weights = cluster share (summing to 1).
     from scipy.cluster.vq import kmeans2
 
@@ -119,8 +101,7 @@ class Scenario:
     path: np.ndarray = field(repr=False)   # length-horizon multiplier path, path[y] = level*(1+growth)**y
 
     def import_price(self, y: int, base_central: float) -> float:
-        # Scenario import price in year y, GBP/kWh. base_central = year-0 CENTRAL size-band price
-        # (active level multiplier divided out by the caller), escalation supplied by this scenario.
+        # Scenario import price in year y, GBP/kWh. base_central = year-0 central size-band price, escalation supplied by this scenario.
         return base_central * float(self.path[y])
 
 
@@ -128,7 +109,7 @@ def generate_price_scenarios(n_samples: int = DEFAULT_N_SAMPLES,
                              n_reduced: int = DEFAULT_N_REDUCED,
                              horizon: int = HORIZON_YEARS,
                              seed: int = DEFAULT_SEED) -> list:
-    # Full pipeline: LHS-sample (level, growth) -> build paths -> k-medoid reduce -> weighted Scenarios.
+    # Full pipeline: LHS-sample (level, growth) -> build paths -> reduce to weighted scenarios.
     draws = lhs_samples(n_samples, seed=seed)
     paths = np.array([price_multiplier_path(l, g, horizon) for l, g in draws])
     idx, weights = reduce_scenarios(paths, n_reduced, seed=seed)
@@ -174,22 +155,6 @@ def validate(scenarios: list, n_samples: int = DEFAULT_N_SAMPLES,
 
 
 # 5 - DIAGNOSTICS 
-def _coverage_figure(ax_path: str, n: int = 200, seed: int = DEFAULT_SEED) -> None:
-    import matplotlib.pyplot as plt
-    lhs = lhs_samples(n, seed=seed)
-    mc  = mc_samples(n, seed=seed)
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2), sharex=True, sharey=True)
-    for ax, pts, title in ((axes[0], mc, f"Monte Carlo (n={n})"),
-                           (axes[1], lhs, f"Latin Hypercube (n={n})")):
-        ax.scatter(pts[:, 0], pts[:, 1], s=10, alpha=0.5, edgecolors="none")
-        ax.set_title(title)
-        ax.set_xlabel("level multiplier")
-    axes[0].set_ylabel("annual escalation rate")
-    fig.suptitle("Sampling coverage of the electricity import-price space")
-    fig.tight_layout()
-    fig.savefig(ax_path, dpi=150)
-    plt.close(fig)
-
 def _fan_chart(out_path: str, scenarios: list, n: int = DEFAULT_N_SAMPLES,
                horizon: int = HORIZON_YEARS, seed: int = DEFAULT_SEED) -> None:
     import matplotlib.pyplot as plt
@@ -218,9 +183,8 @@ def main():
     print(tbl.to_string(index=False))
     print("\nValidation:", validate(scen))
     tbl.to_csv(os.path.join(out_dir, "price_scenarios.csv"), index=False)
-    _coverage_figure(os.path.join(out_dir, "lhs_vs_mc_coverage.png"))
     _fan_chart(os.path.join(out_dir, "price_scenario_fan.png"), scen)
-    print(f"\nWrote scenario table + figures to {out_dir}")
+    print(f"\nWrote scenario table + figure to {out_dir}")
 
 
 if __name__ == "__main__":

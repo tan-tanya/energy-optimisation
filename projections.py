@@ -1,7 +1,7 @@
 """
-Run only via import, by demand_profile_model.py, to regenerate climate and electricity projection outputs:
+Run only via import, by demand_profile_model.py, to generate climate and electricity projection outputs:
 
-ELECTRICITY — non-heating electricity demand growth factors from DESNZ's Reference scenario.
+ELECTRICITY: non-heating electricity demand growth factors from DESNZ's Reference scenario.
     Inputs
     1. data/model_parameters.xlsx; Scalars 'ELEC_DEMAND_TWH [YYYY]' rows
         - DESNZ Reference non-heating electricity demand (TWh) by year, transcribed from DESNZ Annex F
@@ -12,7 +12,8 @@ ELECTRICITY — non-heating electricity demand growth factors from DESNZ's Refer
         - growth_factor      (year TWh / 2025 TWh; applied to baseload electricity in downstream demand)
     Pipeline: _load_electricity_series() -> run_electricity_projection()
 
-CLIMATE — monthly temperature distributions fitted from 2025 HDDs, projected forward under UKCP18 RCP8.5.
+CLIMATE: monthly temperature distributions fitted from recent HDDs (the last
+         datasets.HDD_BASELINE_YEARS calendar years), projected forward under UKCP18 RCP8.5.
     Inputs
     1. data/hdd/{ICAO}_HDD_15.5C.csv; daily heating degree-days (T_base = 15.5 C) per district (Met Office)
     2. data/climateprojections/UKCP_{region}.csv; UKCP18 RCP8.5 monthly mean-temperature anomalies, 2026-2080
@@ -27,7 +28,7 @@ CLIMATE — monthly temperature distributions fitted from 2025 HDDs, projected f
             Days with HDD = 0 are right-censored at T_base as no heating is required.
         (b) Fit T ~ N(mu, sigma) per district per month:
                 - standard MLE when <5% of days are censored
-                - censored MLE otherwise (adds the censored-mass term n_cen . log P(T >= T_base))
+                - censored MLE otherwise 
         (c) Closed-form expected HDD under a normal:
                 E[HDD] = (T_base - mu) . Phi(z) + sigma . phi(z),   z = (T_base - mu) / sigma
         (d) Project future HDDs by shifting mu by the UKCP18 monthly ensemble-mean delta-T, holding sigma fixed.
@@ -106,7 +107,7 @@ MONTH_NAMES = dict(enumerate(month_name))
 
 # UKCP_TO_DISTRICT comes from the districts registry (imported above).
 
-# Expected HDD when daily-mean T ~ N(mu, sigma); vectorised over arrays
+# Expected HDD when daily-mean T ~ N(mu, sigma)
 def expected_hdd(mu, sigma, t_base=HDD_BASE):
     z = (t_base - mu) / sigma
     return (t_base - mu) * norm.cdf(z) + sigma * norm.pdf(z)
@@ -178,7 +179,7 @@ def _fit_district(district, icao):
     return rows
 
 def run_sigma_fit():
-    # Fit N(mu, sigma) per district per month from 2025 HDD data
+    # Fit N(mu, sigma) per district per month from the last datasets.HDD_BASELINE_YEARS years of HDD data
     all_rows = []
     for district, icao in DISTRICT_STATIONS.items():
         all_rows.extend(_fit_district(district, icao))

@@ -1,9 +1,10 @@
 """
 Matplotlib renderers for the optimisation model.
 
-Two figures:
-  - plot_dispatch():   the stage-2 optimal half-hourly dispatch for representative day(s).
-  - plot_cell_front(): the cost/carbon frontier for one (district, activity) cell across heating types.
+Three figures:
+  - plot_dispatch():       the stage-2 optimal half-hourly dispatch for representative day(s).
+  - plot_demand_profile(): the underlying heat vs non-heat electricity demand for the same cell/day.
+  - plot_cell_front():     the cost/carbon frontier for one (district, activity) cell across heating types.
 """
 import os
 
@@ -11,17 +12,39 @@ import numpy as np
 import pulp
 
 import demand_profile_model as dm
-import optimisation_model as om
+import optimisation_engine as oe
 from model_params import TECH_COSTS
-from optimisation_config import HH_PER_DAY, T_RES_H, HORIZON_YEARS, DEFAULT_TIME_LIMIT_S
+from seasons import HH_PER_DAY
+from optimisation_config import T_RES_H, HORIZON_YEARS, DEFAULT_TIME_LIMIT_S
 
 
 def activity_area_suffix(activity: str) -> str:
     # Append the building's BEES median floor area after an activity name in a title/label. 
-    # Empty string if dm isn't initialised yet or the activity is unknown.
     areas = getattr(dm, "bees_floor_areas", None) or {}
     a = areas.get(activity)
     return f" ({a:,.0f} m²)" if a else ""
+
+
+def _norm_month(m) -> str:
+    # Accept 'Jan' / 'jan' / 'January' and return the canonical MONTHS_ORDER name.
+    ml = str(m).strip().lower()
+    for full in dm.MONTHS_ORDER:
+        if full.lower().startswith(ml):
+            return full
+    raise ValueError(f"unknown month {m!r}; expected one of {dm.MONTHS_ORDER}")
+
+
+def spec_line(r, wrapped: bool = False) -> str:
+    """Compact technical summary of one design: PV size + capacity factor + battery and thermal-store capacity."""
+    pv   = getattr(r, "pv_kwp", 0.0) or 0.0
+    gen  = getattr(r, "annual_pv_gen_kwh", 0.0) or 0.0
+    cf   = (gen / (pv * 8760.0)) if pv > 0 else 0.0
+    batt = getattr(r, "e_batt_kwh", 0.0) or 0.0
+    tst  = getattr(r, "e_th_kwh", 0.0) or 0.0
+    pv_txt = f"PV {pv:.0f}kWp (CF {cf:.0%})" if pv > 0 else "PV 0kWp"
+    if wrapped:
+        return f"{pv_txt}\nBatt {batt:.0f}kWh  TST {tst:.0f}kWh"
+    return f"{pv_txt} · Batt {batt:.0f}kWh · TST {tst:.0f}kWh"
 
 
 def _save_fig(fig, out_path: str, label: str):
@@ -74,35 +97,23 @@ def plot_dispatch(district: str, activity: str, heating: str = "Gas Boiler", *,
                   out_path: str = None, solver_msg: bool = False):
     """Builds and solves a single (district, activity, heating) instance, then plots the optimal
     half-hourly dispatch for the chosen representative day(s) as one panel per month:
-      - left axis: three NET electrical power lines — PV (generation), Grid (+ import / − export),
-        and Load+HP (total electrical load = non-heat demand + heat-pump electricity).
-      - right axis: state of charge as % of installed capacity — Battery and Thermal store share
-        the one axis. Flat at 0 all day if that technology wasn't sized (i.e. not cost-effective
-        for this design).
-    """
+      - left axis: PV (generation), Grid (+ import / − export), and Load+HP (non-heat demand + heat-pump electricity).
+      - right axis: SoC as % of installed capacity. Flat at 0 all day if that technology wasn't sized."""
     import matplotlib
     if out_path is not None:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MultipleLocator
 
-    om._ensure_dm_initialized()
-    # Normalise month labels to MONTHS_ORDER (accept 'Jan'/'jan'/'January', case-insensitive prefix)
-    def _norm_month(m):
-        ml = str(m).strip().lower()
-        for full in dm.MONTHS_ORDER:
-            if full.lower().startswith(ml):
-                return full
-        raise ValueError(f"unknown month {m!r}; expected one of {dm.MONTHS_ORDER}")
+    oe._ensure_dm_initialized()
     months = [_norm_month(m) for m in months]
     if scenarios is None:
-        scenarios = [om.central_scenario()]              # deterministic single dispatch by default
-    # Re-solve the exact design to be plotted. For a knee/interior point this is a cost-min solve
-    # under an emissions cap; for the anchors it's a plain cost- or emissions-min solve.
-    prob, V = om.build_milp(district, activity, heating,
+        scenarios = [oe.central_scenario()]              # deterministic single dispatch by default
+    # Re-solve the exact design to be plotted. 
+    prob, V = oe.build_lp(district, activity, heating,
                             horizon_years=horizon_years, objective=objective,
                             emissions_cap=emissions_cap, scenarios=scenarios)
-    solver = om._make_solver(solver_msg, time_limit_s)
+    solver = oe._make_solver(solver_msg, time_limit_s)
     status = prob.solve(solver)
     if pulp.LpStatus[status] not in ("Optimal", "Not Solved"):
         raise RuntimeError(f"dispatch solve not optimal: {pulp.LpStatus[status]} "
@@ -116,7 +127,6 @@ def plot_dispatch(district: str, activity: str, heating: str = "Gas Boiler", *,
     SOC_COL  = "#4a4a4a"
     BATT_COL = "#2E8B57"
     TH_COL   = "#6A3D9A"
-    is_hp  = V["is_hp"]
     e_batt = float(pulp.value(V["e_batt"]) or 0.0)
     e_th   = float(pulp.value(V["e_th"])   or 0.0)
 
@@ -135,9 +145,7 @@ def plot_dispatch(district: str, activity: str, heating: str = "Gas Boiler", *,
         ax.set_xlim(0, 24); ax.xaxis.set_major_locator(MultipleLocator(2))
         ax.grid(lw=0.3, alpha=0.4)
 
-        # State of charge on the shared right-hand axis, as % of installed capacity so the
-        # battery (kWh) and thermal store (kWh_th) fit on the one scale. An unsized technology
-        # has no capacity to normalise by, so it's drawn flat at 0%.
+        # State of charge on the shared right-hand axis, as % of installed capacity.
         ax_pct = ax.twinx()
         batt_pct = 100.0 * s["soc_kwh"]    / e_batt if e_batt > 0 else np.zeros_like(x)
         th_pct   = 100.0 * s["th_soc_kwh"] / e_th   if e_th   > 0 else np.zeros_like(x)
@@ -159,11 +167,11 @@ def plot_dispatch(district: str, activity: str, heating: str = "Gas Boiler", *,
                fontsize=9, bbox_to_anchor=(0.5, -0.01))
     n_pv = int(round(float(pulp.value(V["n_pv"])) or 0))
     o_b  = float(pulp.value(V["o_batt"]) or 0.0)
-    fig.suptitle(f"Optimal dispatch — {activity}{activity_area_suffix(activity)} · {district} · {heating}  "
+    fig.suptitle(f"Optimal dispatch — {activity}{activity_area_suffix(activity)} · {district} · {heating}\n"
                  f"(year {year}; PV {n_pv * TECH_COSTS['pv']['module_kwp']:.0f} kWp, "
                  f"battery {e_batt:.0f} kWh / {o_b:.0f} kW, thermal store {e_th:.0f} kWh$_{{th}}$)",
                  fontsize=11, fontweight="bold")
-    fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.94))
 
     if out_path is not None:
         _save_fig(fig, out_path, "dispatch figure")
@@ -181,20 +189,14 @@ def plot_demand_profile(district: str, activity: str, *,
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MultipleLocator
 
-    om._ensure_dm_initialized()
-    def _norm_month(m):
-        ml = str(m).strip().lower()
-        for full in dm.MONTHS_ORDER:
-            if full.lower().startswith(ml):
-                return full
-        raise ValueError(f"unknown month {m!r}; expected one of {dm.MONTHS_ORDER}")
+    oe._ensure_dm_initialized()
     months = [_norm_month(m) for m in months]
 
     # Demand inputs (supply-agnostic): non-heat electricity + useful heat, with the same horizon growth.
-    demand_kwh  = om.building_demand_kwh(activity, district)            # kWh/half-hour per (month, day-type)
-    heat_kwh    = om.building_heat_demand_kwh(activity, district)       # kWh_th/half-hour per (month, day-type)
-    elec_growth = om.elec_growth_factors(horizon_years)
-    heat_growth = om.heat_growth_factors(district, horizon_years)
+    demand_kwh  = oe.building_demand_kwh(activity, district)            # kWh/half-hour per (month, day-type)
+    heat_kwh    = oe.building_heat_demand_kwh(activity, district)       # kWh_th/half-hour per (month, day-type)
+    elec_growth = oe.elec_growth_factors(horizon_years)
+    heat_growth = oe.heat_growth_factors(district, horizon_years)
 
     x = np.arange(HH_PER_DAY) * T_RES_H
     fig, axes = plt.subplots(1, len(months), figsize=(6.4 * len(months), 5.4),
@@ -265,14 +267,7 @@ def plot_cell_front(df_front, out_path: str = None, *, title: str = None):
         ax.scatter([k["lifetime_emissions_tco2e"]], [k["total_cost_npv_GBP"]], marker="*",
                    s=320, color="#d62728", edgecolors="k", linewidths=0.6, zorder=5,
                    label=f"Knee — {k['heating']}")
-        pv   = k.get("pv_kwp", 0.0) or 0.0
-        gen  = k.get("annual_pv_gen_kwh", 0.0) or 0.0
-        cf   = (gen / (pv * 8760.0)) if pv > 0 else 0.0
-        batt = k.get("e_batt_kwh", 0.0) or 0.0
-        tst  = k.get("e_th_kwh", 0.0) or 0.0
-        pv_txt = f"PV {pv:.0f}kWp (CF {cf:.0%})" if pv > 0 else "PV 0kWp"
-        spec = f"{pv_txt} · Batt {batt:.0f}kWh · TST {tst:.0f}kWh"
-        ax.annotate(spec, (k["lifetime_emissions_tco2e"], k["total_cost_npv_GBP"]),
+        ax.annotate(spec_line(k), (k["lifetime_emissions_tco2e"], k["total_cost_npv_GBP"]),
                     xytext=(12, -16), textcoords="offset points", fontsize=7.5, zorder=6,
                     bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", alpha=0.9))
     ax.set_xlabel("Lifetime emissions (tCO₂e, lower → better)")

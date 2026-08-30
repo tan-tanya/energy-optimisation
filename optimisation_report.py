@@ -1,22 +1,28 @@
 """
-Import-only, by optimisation_model.
+Import-only, by optimisation_model. Summary cover sheet + figures for the optimisation results workbook.
 
-Summary cover sheet + figures for the optimisation results workbook.
+Workbook sheets, in the order they are written (chart tabs first, then the data behind them).
 
-Workbook sheets (in order):
-    Cover            key inputs & assumptions (economics, price bands, capex, grid limits, run metadata)
-    Status           solver status by district x activity, one small-multiple panel per heating
-                     system, with each cell's per-building grid-headroom margin as cell text;
-                     feasible cells shaded light -> dark green by NPV savings
-    Top 10 NPV       bar chart — the 10 (district, activity, heating) scenarios with the highest NPV savings
-    Rankings         mean NPV savings by activity and by district (marginal headlines)
-    NPV Heatmap      district × activity grid, coloured by best-achievable NPV savings
-    Self-supply      self-consumption / self-sufficiency vs recommended PV, by class + roof-area utilisation build-up 
-    Scenario Ranking the full ranked table (data backing)
+    Cover                 key inputs & assumptions (economics, price bands, capex, grid limits, run metadata)
+    Status                solver status by district x activity, one small-multiple panel per heating
+                          system, with each cell's per-building grid-headroom margin as cell text;
+                          feasible cells shaded by NPV savings (green above break-even, amber below)
+    NPV                   top-10 savings, marginal headlines by activity/district, district x activity
+                          heatmap, and the across-scenario robustness spread (stochastic rounds only)
+    Self-supply           self-consumption / self-sufficiency vs recommended PV + roof-area utilisation
+    Carbon                the same three views for carbon savings, plus the MAC grid
+    Pareto                cost/carbon scatter, the same split by heating, and the featured-cell frontier
+    Dispatch              featured-cell knee dispatch + the underlying demand profile (optional)
+    NPV Data              the full ranked cost sweep
+    Carbon Data           the full ranked emissions sweep
+    Pareto Data           the pooled non-dominated set
+    Pareto Front Data     the featured cell's epsilon-constraint frontier (optional)
+    Self-supply Data      NPV-optimal design per district x class, with self-supply rates
+    Roof Util Data        PV roof-area utilisation factors per activity class
+    Grid Sensitivity Data the grid-headroom bisection, when one was run or carried over (optional)
 """
 
 import os
-import sys
 
 import numpy as np
 import pandas as pd
@@ -24,7 +30,7 @@ import matplotlib
 matplotlib.use("Agg")                       # headless: no GUI backend
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-from matplotlib.colors import (LinearSegmentedColormap, ListedColormap, Normalize,
+from matplotlib.colors import (LinearSegmentedColormap, ListedColormap,
                                TwoSlopeNorm, to_rgba)
 from matplotlib.cm import ScalarMappable
 from matplotlib.ticker import FuncFormatter
@@ -33,7 +39,9 @@ from openpyxl.styles import Font, PatternFill
 
 import model_params as mp
 import demand_profile_model as dm
-from demand_profile_model import DISTRICT_STATIONS
+import optimisation_engine as oe
+import optimisation_plots as oplt
+from districts import DISTRICT_STATIONS
 
 # Display orders + short labels.
 DIST_ORDER  = list(DISTRICT_STATIONS.keys())
@@ -48,14 +56,10 @@ HEAT_COLORS = {"Gas Boiler": "#9e9e9e", "ASHP": "#1f77b4",
 ACT_COLORS  = {"Health centre": "#4c72b0", "Hospital": "#c44e52",
                "Office (A/C)": "#dd8452", "Dept store": "#55a868"}
 
-# Both cost rounds write into the same run's charts/ folder, so every figure filename carries the
-# round as a prefix ("deterministic_npv_top10.png", "stochastic_npv_top10.png"). Without it the
-# second round silently overwrote the first and charts/ only ever held one round's figures.
-# Set by write_report() for the duration of one workbook build; "" means unprefixed.
+# Make every figure filename carry the round as a prefix ("deterministic_npv_top10.png", "stochastic_npv_top10.png").
 _CHART_PREFIX = ""
 
-# Battery recommendations below this are numerical dribble from the LP rather than a design
-# decision, and are plotted as "no storage" (see _fig_self_supply).
+# Minimum battery capacity to be considered installed.
 _BATT_FLOOR_KWH = 1.0
 
 _HDR_FILL = PatternFill("solid", fgColor="DDE7F0")
@@ -63,7 +67,8 @@ _TITLE_FONT, _SECT_FONT, _BOLD = Font(bold=True, size=14), Font(bold=True, size=
 
 
 def _act_area_map() -> dict:
-    # {act_short: BEES median premises floor area m²}. Used to append the floor area to activity-class labels on categorical axes.
+    # {act_short: BEES median premises floor area m²}. 
+    # Append floor area to activity-class labels on categorical axes.
     areas = getattr(dm, "bees_floor_areas", None) or {}
     return {ACT_SHORT.get(a, a): v for a, v in areas.items()}
 
@@ -74,9 +79,9 @@ def _act_label(act_short: str, area_map: dict) -> str:
     return f"{act_short} ({a:,.0f} m²)" if a else act_short
 
 
-def _act_labels(area_map: dict) -> list:
-    # ACT_ORDER short labels with area appended — for categorical activity axes.
-    return [_act_label(a, area_map) for a in ACT_ORDER]
+def _act_labels(area_map: dict, acts: list = None) -> list:
+    # Short activity labels with area appended — for categorical activity axes. 
+    return [_act_label(a, area_map) for a in (acts if acts is not None else ACT_ORDER)]
 
 
 def _gbp(x: float) -> str:
@@ -100,6 +105,13 @@ def _tco2e(x: float) -> str:
     return f"{x/1e3:.1f}k t" if abs(x) >= 1e3 else f"{x:.0f} t"
 
 
+def _mac(x: float) -> str:
+    # Signed £/tCO₂e label. Negative: abatement that pays for itself; Positive: abatement that costs money.
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    return f"{'−' if x < 0 else ''}£{abs(x):,.0f}/t"
+
+
 def _dual_text(value_fmt, v, cost=None, carbon=None) -> str:
     # Data-callout text for one bar/cell: "£X, Y t".
     if cost is not None and carbon is not None:
@@ -107,25 +119,14 @@ def _dual_text(value_fmt, v, cost=None, carbon=None) -> str:
     return value_fmt(v)
 
 
+# Compact design summary (PV size + capacity factor + battery / thermal store). Defined once in
+# optimisation_plots so the workbook labels and the standalone charts cannot drift apart.
 def _spec_line(r) -> str:
-    # Compact technical-performance summary for one design: PV size + capacity factor (site/weather dependent) + battery & thermal-store capacity.
-    pv   = getattr(r, "pv_kwp", 0.0) or 0.0
-    gen  = getattr(r, "annual_pv_gen_kwh", 0.0) or 0.0
-    cf   = (gen / (pv * 8760.0)) if pv > 0 else 0.0
-    batt = getattr(r, "e_batt_kwh", 0.0) or 0.0
-    tst  = getattr(r, "e_th_kwh", 0.0) or 0.0
-    pv_txt = f"PV {pv:.0f}kWp (CF {cf:.0%})" if pv > 0 else "PV 0kWp"
-    return f"{pv_txt} · Batt {batt:.0f}kWh · TST {tst:.0f}kWh"
+    return oplt.spec_line(r)
 
 
 def _spec_line_wrapped(r) -> str:
-    pv   = getattr(r, "pv_kwp", 0.0) or 0.0
-    gen  = getattr(r, "annual_pv_gen_kwh", 0.0) or 0.0
-    cf   = (gen / (pv * 8760.0)) if pv > 0 else 0.0
-    batt = getattr(r, "e_batt_kwh", 0.0) or 0.0
-    tst  = getattr(r, "e_th_kwh", 0.0) or 0.0
-    pv_txt = f"PV {pv:.0f}kWp (CF {cf:.0%})" if pv > 0 else "PV 0kWp"
-    return f"{pv_txt}\nBatt {batt:.0f}kWh  TST {tst:.0f}kWh"
+    return oplt.spec_line(r, wrapped=True)
 
 
 # FIGURES 
@@ -163,7 +164,7 @@ def _fig_top10(dfo: pd.DataFrame, charts_dir: str, *, value_col: str, value_fmt,
 def _fig_marginal(dfo: pd.DataFrame, charts_dir: str, *, value_col: str, value_fmt,
                   value_label: str, fname: str,
                   cost_col: str = None, carbon_col: str = None) -> str:
-    # Headline ranking = best ACHIEVABLE value per activity / per district.
+    # Headline ranking = best achievable value per activity / per district.
     def _best_per(group_col, order):
         idx = dfo.groupby(group_col)[value_col].idxmax()
         return dfo.loc[idx.values].set_index(group_col).reindex(order).sort_values(value_col)
@@ -210,7 +211,7 @@ def _fig_marginal(dfo: pd.DataFrame, charts_dir: str, *, value_col: str, value_f
 def _fig_heatmap(dfo: pd.DataFrame, charts_dir: str, *, value_col: str, value_fmt,
                  title: str, fname: str,
                  cost_col: str = None, carbon_col: str = None) -> str:
-    # idxmax (not a plain pivot max) keeps the winning row per cell so it can be labelled with the
+    # Keeps the winning row per cell so it can be labelled with the
     # heating system + PV/battery/store spec that achieves the cell's best value.
     idx  = dfo.groupby(["district", "act_short"])[value_col].idxmax()
     best = dfo.loc[idx.values].set_index(["district", "act_short"])
@@ -249,31 +250,46 @@ _STATUS_COLORS = {
 }
 _STATUS_ORDER = list(_STATUS_COLORS)
 
-# Feasible (Optimal) cells keep the green identity but are shaded light -> dark by NPV savings, so
-# the grid reads on two levels: hue says feasible/infeasible, depth says how good the project is.
-# Ramp starts at a pale (not white) green so the lightest feasible cell is still unmistakably green
-# against the white "not solved" background.
-_NPV_GREENS = LinearSegmentedColormap.from_list("feasible_npv", ["#e5f5e0", "#00441b"])
-_NPV_SHADE_FLOOR = 0.12          # never fully pale: the worst feasible cell still reads as green
+# Hue says whether the project is worth doing (green = positive NPV, amber = negative NPV, red = not feasible);
+# Depth says by how much.
+_NPV_DIVERGING = LinearSegmentedColormap.from_list(
+    "feasible_npv", [(0.00, "#7f3f00"), (0.25, "#e08214"), (0.50, "#ffffff"),
+                     (0.75, "#41ab5d"), (1.00, "#00441b")])
+# Flat fallbacks for a figure whose feasible cells carry no usable NPV range 
+# (single value, or a results set without the column).
+_NPV_FLAT_POS = _STATUS_COLORS["Optimal"]
+_NPV_FLAT_NEG = "#e08214"
 
 
-def _npv_shade(v, vmin: float, vmax: float) -> tuple:
-    # Green shade for one feasible cell. Falls back to the flat status green when the cell has no
-    # NPV (e.g. a status grid built from a results set without the column) or the range is degenerate.
-    if v is None or vmin is None or vmax is None or not np.isfinite([v, vmin, vmax]).all():
-        return to_rgba(_STATUS_COLORS["Optimal"])
-    t = 0.5 if vmax <= vmin else (v - vmin) / (vmax - vmin)
-    return _NPV_GREENS(_NPV_SHADE_FLOOR + (1.0 - _NPV_SHADE_FLOOR) * t)
+def _npv_norm(vmin, vmax):
+    # Diverging norm centred on zero NPV.
+    if vmin is None or vmax is None or not np.isfinite([vmin, vmax]).all():
+        return None
+    lo, hi = min(float(vmin), 0.0), max(float(vmax), 0.0)
+    if lo == hi:
+        return None
+    span = hi - lo
+    lo = min(lo, -0.1 * span)
+    hi = max(hi, 0.1 * span)
+    return TwoSlopeNorm(vcenter=0.0, vmin=lo, vmax=hi)
+
+
+def _npv_shade(v, norm) -> tuple:
+    if v is None or not np.isfinite(v):
+        return to_rgba(_NPV_FLAT_POS)
+    if norm is None:
+        return to_rgba(_NPV_FLAT_NEG if v < 0 else _NPV_FLAT_POS)
+    return _NPV_DIVERGING(float(np.clip(norm(v), 0.0, 1.0)))
 
 
 def _text_color(rgba: tuple) -> str:
-    # Black on pale cells, white on dark ones — the NPV ramp spans both ends of the contrast range.
+    # Black on pale cells, white on dark cells.
     r, g, b = rgba[:3]
     return "black" if (0.299 * r + 0.587 * g + 0.114 * b) > 0.55 else "white"
 
 
 def _edge_margin_label(r) -> str:
-    # One cell's grid-connection headroom margin as text, on grid_sensitivity.py's signed scale:
+    # One cell's grid-connection headroom margin as text.
     # positive = demand-growth margin today's DNO ceiling can still absorb (cell Optimal today);
     # negative = how much bigger the ceiling would need to be to reach feasibility (cell infeasible).
     # Cells whose bisection ran out of search range never measured an edge labelled as a "non-result".
@@ -286,8 +302,7 @@ def _edge_margin_label(r) -> str:
     mult_txt = f"{mult:.1f}x" if mult < 10.0 else f"{mult:.0f}x"
     kw = r["edge_margin_kw"]
     kw_txt = f"{kw:+,.0f} kW" if pd.notna(kw) else "? kW"
-    # One line, multiplier first with the absolute headroom in brackets — e.g. "41x (+11,084 kW)".
-    # Same string in the chart cells and the Grid Sensitivity Data column, so the two read alike.
+    # One line, multiplier first with absolute headroom in brackets — e.g. "41x (+11,084 kW)".
     return f"{mult_txt} ({kw_txt})"
 
 
@@ -295,31 +310,25 @@ def _fig_status_grid(df_raw: pd.DataFrame, charts_dir: str, *, title: str, fname
                      grid_sensitivity: pd.DataFrame = None, npv_col: str = "npv_savings_GBP") -> str:
     # One district x activity panel per heating system. Cell text carries each cell's grid-headroom margin.
     # Heat-pump heatings only: Gas Boiler draws no heat-pump electricity so it has no margin row.
-    # Feasible cells are additionally shaded by npv_col (light -> dark green = worse -> better NPV);
-    # infeasible/no-incumbent cells keep their flat category colour.
     d = df_raw.copy()
-    # Every flavour of infeasible reads as one category here: the qualified strings the engine can
-    # still emit ("Infeasible (solver tolerance)", and "Infeasible (land)" on runs predating the
-    # rename) say why, not whether, and splitting the legend on that made a heating type look like
-    # two different outcomes. The raw status survives on the data sheets for diagnosis.
     d["status"] = d["status"].where(~d["status"].astype(str).str.startswith("Infeasible"),
                                     "Infeasible")
     d["act_short"] = d["activity"].map(lambda a: ACT_SHORT.get(a, a))
     other = [s for s in d["status"].unique() if s not in _STATUS_COLORS]
     status_colors = dict(_STATUS_COLORS)
     status_order = list(_STATUS_ORDER)
-    for s in other:                             # tolerate any status not in the known palette
+    for s in other:                             
         status_colors[s] = "#6a1b9a"
         status_order.append(s)
     act_labels = _act_labels(_act_area_map())
 
-    # NPV shading range is taken across every feasible cell in the figure (all four heating panels),
-    # so a shade means the same thing in each panel and heating systems stay comparable by eye.
+    # NPV shading range is taken across every feasible cell in the figure (all four heating panels).
     has_npv = npv_col in d.columns
     npv_vals = pd.to_numeric(d.loc[d["status"] == "Optimal", npv_col], errors="coerce").dropna() \
         if has_npv else pd.Series(dtype=float)
     vmin = float(npv_vals.min()) if not npv_vals.empty else None
     vmax = float(npv_vals.max()) if not npv_vals.empty else None
+    npv_norm = _npv_norm(vmin, vmax)
 
     margins = {}
     if grid_sensitivity is not None and not grid_sensitivity.empty:
@@ -337,15 +346,13 @@ def _fig_status_grid(df_raw: pd.DataFrame, charts_dir: str, *, title: str, fname
         npv_piv = (sub.pivot_table(index="district", columns="act_short", values=npv_col,
                                    aggfunc="max")
                       .reindex(index=DIST_ORDER, columns=ACT_ORDER)) if has_npv else None
-        # Painted as an explicit RGBA image rather than a categorical colormap: feasible cells each
-        # need their own shade, so there is no longer one colour per status to look up.
         rgba = np.ones((len(DIST_ORDER), len(ACT_ORDER), 4))     # white = cell absent from results
         for i in range(len(DIST_ORDER)):
             for j in range(len(ACT_ORDER)):
                 s = piv.iat[i, j]
                 if not isinstance(s, str):
                     continue
-                rgba[i, j] = (_npv_shade(npv_piv.iat[i, j] if npv_piv is not None else None, vmin, vmax)
+                rgba[i, j] = (_npv_shade(npv_piv.iat[i, j] if npv_piv is not None else None, npv_norm)
                               if s == "Optimal" else to_rgba(status_colors[s]))
         ax.imshow(rgba, aspect="auto")
         ax.set_xticks(range(len(ACT_ORDER)), act_labels, fontsize=8)
@@ -358,50 +365,38 @@ def _fig_status_grid(df_raw: pd.DataFrame, charts_dir: str, *, title: str, fname
                 if not isinstance(s, str):
                     continue
                 npv_v = npv_piv.iat[i, j] if npv_piv is not None else None
-                # Feasible cells lead with the NPV the shade encodes, so cells can also be ranked
-                # by reading rather than by comparing shades.
                 head = [_gbp(npv_v)] if (s == "Optimal" and npv_v is not None and np.isfinite(npv_v)) else \
                        ([] if s == "Optimal" else [s])
-                # Margin only on cells that solved: the bisection never measures an edge for a cell
-                # that is infeasible anyway, so printing its "unbounded" non-result on every one of
-                # them just repeats noise over the whole panel.
+                # Margin only on cells that solved.
                 show_margin = s == "Optimal" and (h, dist, act) in margins
                 parts = head + ([margins[(h, dist, act)]] if show_margin else [])
                 if parts:
                     ax.text(j, i, "\n".join(parts), ha="center", va="center", fontsize=6.5,
                             color=_text_color(rgba[i, j]), linespacing=1.2, wrap=True)
-    shaded = vmin is not None
-    # Each line is emitted only when that content is actually on the chart, so the title never
-    # promises cell text a --skip-grid-sensitivity run did not produce.
+    shaded = npv_norm is not None
     notes = []
     if shaded:
         notes.append("Cell text (Line 1): NPV savings vs gas boiler BAU")
-    # These multipliers come from a fixed-sizing bisection (baseline PV, no battery, baseline thermal store),
-    # because a free re-solve lets the optimiser buy storage purely to hide the peak.
-    # They are also per-building: today's spare headroom allocated entirely to this one site.
+    # Fixed-sizing bisection (baseline PV, no battery, baseline thermal store),
+    # because a free re-solve lets the optimiser buy storage to reduce the peak.
     if margins:
         notes.append("Cell text (Line 2): demand growth each building can add before the DNO "
                      "import ceiling binds")
     if notes:
         title += "\n" + "\n".join(notes)
     fig.suptitle(title, fontweight="bold", fontsize=13)
-    # With the gradient active, one flat green patch would misrepresent the feasible cells, so the
-    # "Optimal" entry moves out of the categorical legend and onto the colourbar below it.
     handles = [Patch(color=status_colors[s], label=s) for s in status_order
                if not (shaded and s == "Optimal")]
     fig.legend(handles=handles, title="Solver status", fontsize=9, title_fontsize=9,
                loc="upper left", bbox_to_anchor=(1.0, 0.95))
     fig.tight_layout(rect=(0, 0, 0.98, 0.95))    # before add_axes: tight_layout ignores manual axes
     if shaded:
-        # Colourbar spans the same floor-to-1 slice of the ramp the cells are painted from, so the
-        # bar's endpoints are the actual lightest and darkest cell colours in the figure.
-        sm = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax),
-                            cmap=LinearSegmentedColormap.from_list(
-                                "feasible_npv_bar",
-                                _NPV_GREENS(np.linspace(_NPV_SHADE_FLOOR, 1.0, 256))))
+        # White point sits exactly on break-even.
+        sm = ScalarMappable(norm=npv_norm, cmap=_NPV_DIVERGING)
         cax = fig.add_axes((1.005, 0.35, 0.012, 0.32))
         cb  = fig.colorbar(sm, cax=cax, format=FuncFormatter(lambda v, _: _gbp(v)))
-        cb.set_label("Optimal (feasible) — NPV savings vs gas-boiler BAU", fontsize=9)
+        cb.set_label("Optimal (feasible) — NPV savings vs gas-boiler BAU"
+                     "\n(amber = negative, white = break-even)", fontsize=9)
         cb.ax.tick_params(labelsize=8)
     return _save(fig, charts_dir, fname)
 
@@ -427,13 +422,14 @@ def _status_figs(dfs: dict, charts_dir: str, grid_sensitivity) -> list:
     return figs
 
 
-_MAC_TITLE = "Marginal Abatement Cost by district × activity × heating"
+_MAC_TITLE = ("Marginal Abatement Cost by district × activity × heating\n"
+              "(against the cost-optimal gas boiler + PV design at the same site)\n"
+              "Cell text (Line 1): marginal abatement cost   ·   (Line 2): change in annual "
+              "primary energy vs that same design")
 
 
 def _model_carbon_value(d: pd.DataFrame) -> float:
-    # The model's own discounted average carbon value (£/tCO2e), recovered from the results rather
-    # than re-derived from CARBON_VALUES, so it tracks whatever trajectory the run actually used:
-    # carbon_value_npv_GBP is that trajectory applied to the design's own lifetime emissions.
+    # The model's own discounted average carbon value (£/tCO2e).
     need = {"carbon_value_npv_GBP", "lifetime_emissions_tco2e"}
     if not need <= set(d.columns):
         return float("nan")
@@ -442,11 +438,19 @@ def _model_carbon_value(d: pd.DataFrame) -> float:
     return float(np.nanmedian((num / den.where(den > 0)).to_numpy(dtype=float)))
 
 
+def _primary_energy_label(pct, kwh) -> str:
+    # One cell's change in annual primary energy against the gas+PV counterfactual.
+    if pct is None or kwh is None or not np.isfinite([pct, kwh]).all():
+        return ""
+    mwh = kwh / 1000.0
+    mwh_txt = f"{mwh:+,.0f} MWh/yr" if abs(mwh) >= 10 else f"{mwh:+,.1f} MWh/yr"
+    return f"{pct:+.0f}% primary\n({mwh_txt})"
+
+
 def _fig_mac_grid(dfo: pd.DataFrame, charts_dir: str, *, fname: str = "mac_grid.png") -> str:
-    # Built from the COST sweep only. MAC divides a design's extra cost over BAU by the tonnes it
-    # abates, so it is only a *cost* of abatement when the design was chosen under cost pressure.
-    # The emissions sweep's equivalent column is cost-blind by construction and is deliberately not
-    # the source here (it ships as cost_of_emissions_optimal_design_GBP_per_tco2e instead).
+    # Built from the cost sweep only. MAC divides a design's extra cost over the counterfactual by the
+    # tonnes it abates, so it is only a cost abatement when the design was chosen under cost pressure.
+    # Only the heat pump designs are plotted.
     col = "mac_GBP_per_tco2e"
     if col not in dfo.columns:
         return None
@@ -458,57 +462,73 @@ def _fig_mac_grid(dfo: pd.DataFrame, charts_dir: str, *, fname: str = "mac_grid.
 
     cval   = _model_carbon_value(d)
     centre = cval if np.isfinite(cval) else float(vals.median())
-    # The ramp floors at £0 rather than at the most negative MAC. A design that abates AND saves
-    # money is already a no-regret call, so how far below zero it sits carries no extra decision
-    # weight — while letting it set the bound (gas+PV reaches about -£3,200/t) would compress the
-    # entire £0-£500 band where the heat pumps actually separate into one indistinguishable shade.
-    # Sub-zero cells clip to the green end; the printed value still shows the true figure.
     lo = 0.0 if float(vals.min()) < 0.0 else float(np.nanpercentile(vals, 5))
     lo = min(lo, centre - 1.0)
-    # Percentile bound, not max: one runaway cell would otherwise flatten every other colour.
+    # Percentile bound: one runaway cell would otherwise flatten every other colour.
     hi = max(float(np.nanpercentile(vals, 95)), centre + 1.0)
     norm = TwoSlopeNorm(vmin=lo, vcenter=centre, vmax=hi)
-    cmap = plt.get_cmap("RdYlGn_r")          # reversed: cheap abatement green, dear abatement red
+    cmap = plt.get_cmap("RdYlGn_r")          
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 13))
-    for ax, h in zip(axes.flat, HEAT_ORDER):
-        sub = d[d["heating"] == h]
+    panels = [h for h in HEAT_ORDER if h != "Gas Boiler"]      # gas is the counterfactual
+    # Only what actually solved gets drawn.
+    solved = d[d[col].notna() & d["heating"].isin(panels)]
+    if solved.empty:
+        return None
+    panels = [h for h in panels if h in set(solved["heating"])]
+    dists  = [x for x in DIST_ORDER if x in set(solved["district"])]
+    acts   = [x for x in ACT_ORDER  if x in set(solved["act_short"])]
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.0 * len(panels), 8.0))
+    pe_cols = [c for c in ("primary_energy_change_pct", "primary_energy_change_kwh")
+               if c in d.columns]
+    for ax, h in zip(np.atleast_1d(axes).ravel(), panels):
+        # One row per cell: the cost-optimal (lowest-MAC) design.
+        sub = (d[d["heating"] == h]
+               .sort_values(col, na_position="last")
+               .drop_duplicates(subset=["district", "act_short"], keep="first"))
         piv = (sub.pivot_table(index="district", columns="act_short", values=col, aggfunc="min")
-                  .reindex(index=DIST_ORDER, columns=ACT_ORDER))
+                  .reindex(index=dists, columns=acts))
         data = piv.to_numpy(dtype=float)
-        rgba = np.ones((len(DIST_ORDER), len(ACT_ORDER), 4))    # white = no optimal design here
-        for i in range(len(DIST_ORDER)):
-            for j in range(len(ACT_ORDER)):
+        pe = {c: (sub.pivot_table(index="district", columns="act_short", values=c, aggfunc="first")
+                     .reindex(index=dists, columns=acts).to_numpy(dtype=float))
+              for c in pe_cols}
+        rgba = np.ones((len(dists), len(acts), 4))    
+        for i in range(len(dists)):
+            for j in range(len(acts)):
                 v = data[i, j]
                 if np.isfinite(v):
                     rgba[i, j] = cmap(float(np.clip(norm(v), 0.0, 1.0)))
         ax.imshow(rgba, aspect="auto")
-        ax.set_xticks(range(len(ACT_ORDER)), _act_labels(_act_area_map()), fontsize=8)
-        ax.set_yticks(range(len(DIST_ORDER)), DIST_ORDER, fontsize=8)
+        ax.set_xticks(range(len(acts)), _act_labels(_act_area_map(), acts), fontsize=8)
+        ax.set_yticks(range(len(dists)), dists, fontsize=8)
         n_cells = int(np.isfinite(data).sum())
-        if not n_cells:
-            ax.set_title(f"{h}  (no optimal design)", fontweight="bold", fontsize=10)
-        elif np.isfinite(cval):
+        if np.isfinite(cval):
             n_below = int((data < cval).sum())
             ax.set_title(f"{h}  ({n_below}/{n_cells} below the carbon value)",
                          fontweight="bold", fontsize=10)
         else:
             ax.set_title(h, fontweight="bold", fontsize=10)
-        for i in range(len(DIST_ORDER)):
-            for j in range(len(ACT_ORDER)):
+        for i in range(len(dists)):
+            for j in range(len(acts)):
                 v = data[i, j]
-                if np.isfinite(v):
-                    ax.text(j, i, f"£{v:,.0f}/t", ha="center", va="center", fontsize=7,
-                            color=_text_color(rgba[i, j]))
+                if not np.isfinite(v):
+                    continue
+                pe_txt = _primary_energy_label(
+                    pe["primary_energy_change_pct"][i, j] if "primary_energy_change_pct" in pe else None,
+                    pe["primary_energy_change_kwh"][i, j] if "primary_energy_change_kwh" in pe else None)
+                tcol = _text_color(rgba[i, j])
+                if pe_txt:
+                    ax.text(j, i - 0.06, f"£{v:,.0f}/t", ha="center", va="bottom", fontsize=7.5,
+                            color=tcol)
+                    ax.text(j, i + 0.08, pe_txt, ha="center", va="top", fontsize=6.0,
+                            color=tcol, linespacing=1.3)
+                else:
+                    ax.text(j, i, f"£{v:,.0f}/t", ha="center", va="center", fontsize=7.5,
+                            color=tcol)
 
-    # Title only. What the colour split means (the carbon value), and why a negative MAC pays for
-    # itself, are covered in the write-up rather than repeated on the figure — the per-panel counts
-    # and the colourbar still carry the reference on the chart itself.
-    fig.suptitle(_MAC_TITLE, fontweight="bold", fontsize=13)
-    # Headroom sized for the one-line title. The 0.93 the status grid uses would leave a band of
-    # empty figure under it, since that grid carries three lines of title and this one carries one.
-    fig.tight_layout(rect=(0, 0, 0.98, 0.965))
-    cax = fig.add_axes((1.005, 0.35, 0.012, 0.32))
+    fig.suptitle(_MAC_TITLE, fontweight="bold", fontsize=13, y=0.985, va="top")
+    # Headroom sized for the title on a single row of panels.
+    fig.tight_layout(rect=(0, 0, 0.98, 0.95))
+    cax = fig.add_axes((1.005, 0.30, 0.012, 0.40))
     cb  = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax,
                        format=FuncFormatter(lambda v, _: f"£{v:,.0f}"))
     cb.set_label("Marginal abatement cost (£/tCO2e) — scale floors at £0", fontsize=9)
@@ -522,7 +542,7 @@ def _fig_robustness(dfo: pd.DataFrame, charts_dir: str) -> str:
     # Robustness of top NPV designs under the import-price scenario set.
     need = {"npv_savings_min_GBP", "npv_savings_max_GBP"}
     if not need.issubset(dfo.columns):
-        return None                                    # deterministic run (single scenario) — skip
+        return None                                    
     top = dfo.nlargest(12, "npv_savings_GBP").iloc[::-1]
     AM = _act_area_map()
     labels = [f"{r.district} · {_act_label(r.act_short, AM)}" for r in top.itertuples()]
@@ -560,8 +580,6 @@ def _fig_self_supply(dfo: pd.DataFrame, charts_dir: str) -> str:
     if best.empty:
         return None
     bmax = float(best["e_batt_kwh"].max())
-    # Sub-kWh recommendations are LP dribble, not a design decision — floor them to "no storage"
-    # so a ~0.3 kWh cell cannot claim the whole marker-area scale.
     if not np.isfinite(bmax) or bmax < _BATT_FLOOR_KWH:
         bmax = 0.0                                          # no battery recommended anywhere
     S_MIN, S_SPAN = 70.0, 290.0                             # marker area for 0 kWh, and growth to bmax
@@ -593,9 +611,7 @@ def _fig_self_supply(dfo: pd.DataFrame, charts_dir: str) -> str:
     # Legends sit to the right of both panels.
     fig.legend(handles=act_handles, title="Activity class", fontsize=8, title_fontsize=8,
                loc="upper left", bbox_to_anchor=(0.845, 0.88))
-    # Battery-area reference legend. Always drawn — a lone "0 kWh" entry is the finding that no
-    # design in the sweep recommended storage (above _BATT_FLOOR_KWH), not a missing series.
-    # Ticks are unrounded so each handle's area is the one the scale actually assigns to its label.
+    # Battery-area reference legend. 
     batt_kwh = [0.0] if bmax <= 0 else sorted({0.0, bmax / 2, bmax})
     batt_handles = [a2.scatter([], [], s=_batt_area(kwh), color="0.6",
                                 edgecolors="k", linewidths=0.4, label=f"{kwh:.3g} kWh")
@@ -610,21 +626,17 @@ def _fig_self_supply(dfo: pd.DataFrame, charts_dir: str) -> str:
 
 
 def _roof_utilisation_rows() -> list:
-    # Effective usable fraction of the roof footprint available for PV, split by roof type. 
-    # Both types share the same per-activity usable-area fraction. They differ only in the roof-type factor:
-    #   flat    = usable-area fraction × inter-row spacing (self-shading between tilted module rows);
-    #   pitched = usable-area fraction × sec(pitch) slope-area gain × orientation/margin fraction. Pitched modules mount flush → no inter-row derate.
-    areas     = getattr(dm, "bees_floor_areas", None) or {}
-    pitch_geo = (1.0 / np.cos(np.radians(mp.ROOF_PITCH_DEG))) * mp.PITCHED_USABLE_SLOPE_FRAC
+    # Effective usable fraction of the roof footprint available for PV, split by roof type.
+    areas = getattr(dm, "bees_floor_areas", None) or {}
     rows = []
     for a in mp.ROOF_PROPERTIES:
-        u = mp.ROOF_PROPERTIES[a]["pv_usable_frac"]
-        r = mp.ROOF_PROPERTIES[a]["pv_inter_row_frac"]
+        flat_eff, pitched_eff = oe.roof_type_usable_fracs(a)
         rows.append({"activity": ACT_SHORT.get(a, a), "activity_full": a,
                      "floor_area_m2": areas.get(a),
-                     "utilisation_rate": u, "inter_row_spacing_factor": r,
-                     "effective_utilisation_flat": u * r,
-                     "effective_utilisation_pitched": u * pitch_geo})
+                     "utilisation_rate": mp.ROOF_PROPERTIES[a]["pv_usable_frac"],
+                     "inter_row_spacing_factor": mp.ROOF_PROPERTIES[a]["pv_inter_row_frac"],
+                     "effective_utilisation_flat": flat_eff,
+                     "effective_utilisation_pitched": pitched_eff})
     return rows
 
 
@@ -637,7 +649,7 @@ def _roof_utilisation_table() -> pd.DataFrame:
 
 
 def _fig_roof_utilisation(charts_dir: str) -> str:
-    # Roof-area utilisation (bar chart + companion table).
+    # Roof-area utilisation.
     rows   = _roof_utilisation_rows()
     AM     = _act_area_map()
     labels = [_act_label(r["activity"], AM) for r in rows]
@@ -727,22 +739,35 @@ def _fig_pareto_scatter(dfp: pd.DataFrame, charts_dir: str) -> str:
                     for h in heat_present]
     heat_handles.append(ax.scatter([], [], facecolors="none", edgecolors="k", s=70.0,
                                    linewidths=1.2, label="Pareto-optimal"))
-    ax.legend(handles=heat_handles, title="Heating", fontsize=8, title_fontsize=8,
-              loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    heat_leg = ax.legend(handles=heat_handles, title="Heating", fontsize=8, title_fontsize=8,
+                         loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    heat_leg._legend_box.align = "left"
+    ax.add_artist(heat_leg)                                # keep it when the second legend is added
     ref = pd.Series([100e3, 750e3, 3.4e6])
     cap_handles = [ax.scatter([], [], s=float(_bubble_size(ref).iloc[i]), c="0.6", alpha=0.55,
                               label=_gbp(float(ref.iloc[i]))) for i in range(len(ref))]
-    fig.legend(handles=cap_handles, title="Total capex (bubble area)", fontsize=8, title_fontsize=8,
-               loc="upper left", bbox_to_anchor=(0.795, 0.62), labelspacing=1.1, borderpad=0.9)
+    # Anchored in axes coords like the heating legend, so both boxes share a left edge.
+    cap_leg = ax.legend(handles=cap_handles, title="Total capex (bubble area)", fontsize=8,
+                        title_fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 0.74),
+                        labelspacing=1.1, borderpad=0.9)
+    cap_leg._legend_box.align = "left"
     fig.tight_layout(rect=(0, 0, 0.78, 1))
     return _save(fig, charts_dir, "pareto_scatter.png")
 
 
+def _best_mac_idx(g: pd.DataFrame) -> int:
+    # Cheapest abatement in one district × activity cell.
+    e = g[(g["heating"] != "Gas Boiler") & g["mac_GBP_per_tco2e"].notna()]
+    if e.empty:
+        e = g[g["mac_GBP_per_tco2e"].notna()]          # gas-only cell: report it rather than blank
+    return None if e.empty else e["mac_GBP_per_tco2e"].idxmin()
+
+
 def _fig_pareto_heating(dfp: pd.DataFrame, charts_dir: str) -> str:
-    # Non-dominated design with the lowest absolute MAC (£/tCO₂e).
+    # Best-performing non-dominated design per cell on a MAC basis.
     pf = dfp[dfp["pareto_optimal"]].copy()
-    pf["abs_mac"] = pf["mac_GBP_per_tco2e"].abs().fillna(np.inf)
-    idx  = pf.groupby(["district", "act_short"])["abs_mac"].idxmin()
+    idx  = [i for _, g in pf.groupby(["district", "act_short"])
+            if (i := _best_mac_idx(g)) is not None]
     best = pf.loc[idx].set_index(["district", "act_short"])
     piv  = (best.reset_index().pivot(index="district", columns="act_short", values="heating")
                 .reindex(index=DIST_ORDER, columns=ACT_ORDER))
@@ -759,13 +784,18 @@ def _fig_pareto_heating(dfp: pd.DataFrame, charts_dir: str) -> str:
               vmin=-0.5, vmax=len(HEAT_ORDER) - 0.5, aspect="auto")
     ax.set_xticks(range(len(ACT_ORDER)), _act_labels(_act_area_map()))
     ax.set_yticks(range(len(DIST_ORDER)), DIST_ORDER)
-    ax.set_title("Best-value Pareto heating (lowest |MAC|)\nby district × activity", fontweight="bold")
+    ax.set_title("Best-value Pareto heating by district × activity\n"
+                 "(lowest £/tCO₂e among designs that electrify heat)", fontweight="bold")
     for i, d in enumerate(DIST_ORDER):
         for j, a in enumerate(ACT_ORDER):
             h = piv.iat[i, j]
             if isinstance(h, str):
                 r = best.loc[(d, a)]
-                label = f"£{r.mac_GBP_per_tco2e:.0f}/t - {HEAT_SHORT[h]}\n{_spec_line_wrapped(r)}"
+                t_saved = getattr(r, "emissions_saving_vs_gaspv_tco2e", None)
+                if t_saved is None or not np.isfinite(t_saved):
+                    t_saved = r.emissions_saving_tco2e
+                label = (f"{_mac(r.mac_GBP_per_tco2e)} · {_tco2e(t_saved)}"
+                         f" - {HEAT_SHORT[h]}\n{_spec_line_wrapped(r)}")
                 ax.text(j, i, label, ha="center", va="center", fontsize=6.5, color="white",
                         linespacing=1.4)
     ax.legend(handles=[Patch(color=HEAT_COLORS[h], label=h) for h in HEAT_ORDER],
@@ -783,7 +813,7 @@ def _save(fig, charts_dir: str, name: str) -> str:
 
 
 def _stack_images(ws, pngs: list, start_row: int = 2, col: str = "B", pad_rows: int = 3) -> None:
-    # Stack chart PNGs down one sheet, spacing each by its own pixel height (~20px per Excel row).
+    # Stack chart PNGs down one sheet.
     r = start_row
     for png in pngs:
         img = XLImage(png)
@@ -818,9 +848,6 @@ def _build_cover(book, run_meta: dict) -> None:
     title("Building PV · Battery · Heat — Optimisation Results")
     kv("Run", run_meta.get("timestamp", ""))
     kv("Scenarios", f"{run_meta.get('n_feasible','?')} / {run_meta.get('n_scenarios','?')} feasible")
-    # No MIP gap quoted: every sizing variable is continuous and the dispatch mutex binaries are
-    # off by default, so each cell is a pure LP solved to optimality — a relative gap would only
-    # understate the precision of the result.
     kv("Solver", f"{run_meta.get('solver','HiGHS')}")
     blank()
 
@@ -846,12 +873,8 @@ def _build_cover(book, run_meta: dict) -> None:
         kv("Uncertain input", "electricity import price (level × escalation); export & gas central")
         table(["Scenario", "Weight", "Yr-0 level", "Escalation/yr"],
               [[sid, f"{w:.3f}", f"×{lvl:.3f}", _pct(g)] for (sid, w, lvl, g) in price_scen])
-        # The level band is right-skewed (triangular, low 0.67 / mode 1.00 / high 2.27), so its mean
-        # sits well above its mode and the scenario set is NOT mean-preserving against the
-        # deterministic round. Stated explicitly because the two rounds' workbooks are read side by
-        # side: most of the stochastic round's higher cost is this level shift, not a cost of
-        # ignoring uncertainty. What IS attributable to uncertainty is that first-stage sizing
-        # barely moves between the rounds.
+        # The level band is right-skewed. Most of the stochastic round's higher cost is thus the level shift, 
+        # not a cost of ignoring uncertainty. 
         _wsum = sum(w for (_, w, _, _) in price_scen)
         if _wsum > 0:
             _mean_lvl = sum(w * lvl for (_, w, lvl, _) in price_scen) / _wsum
@@ -920,6 +943,13 @@ def _write_report(dfs: dict, out_path: str, *,
         d["act_short"] = d["activity"].map(lambda a: ACT_SHORT.get(a, a))
         return d
 
+    # Rebase every marginal abatement cost onto the cost-optimal gas+PV design.
+    _ref = oe.gaspv_reference(dfs["NPV"])
+    if not _ref.empty:
+        for _k in ("NPV", "Carbon", "Pareto", "Pareto front"):
+            if _k in dfs and dfs[_k] is not None and not dfs[_k].empty:
+                dfs[_k] = oe.apply_gaspv_mac(dfs[_k], _ref)
+
     npv    = _prep(dfs["NPV"],    "npv_savings_GBP")
     carbon = _prep(dfs["Carbon"], "emissions_saving_tco2e")
     pareto = _prep(dfs["Pareto"], "npv_savings_GBP")     
@@ -956,8 +986,6 @@ def _write_report(dfs: dict, out_path: str, *,
                          title="Best carbon savings by district × activity\n(best heating per cell)",
                          fname="carbon_heatmap.png",
                          cost_col="npv_savings_GBP", carbon_col="emissions_saving_tco2e"),
-            # Sourced from the cost sweep, not `carbon` — see _fig_mac_grid on why a MAC read off
-            # the emissions sweep would not be a marginal abatement cost.
             _fig_mac_grid(npv, charts_dir),
         ],
         "Pareto": [
@@ -977,10 +1005,7 @@ def _write_report(dfs: dict, out_path: str, *,
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         dfs["NPV"].to_excel(xw,    sheet_name="NPV Data",    index=False)
-        # On the emissions sweep the £/tCO2e figure is NOT a marginal abatement cost: the design it
-        # divides through was chosen with no cost pressure at all, so it is an upper bound on what
-        # the abatement costs, not the cheapest way to buy it. Renamed here to say so. The real MAC
-        # lives on the NPV sheet (cost-optimal design vs BAU) and, as a curve, on Pareto Front Data.
+        # On the emissions sweep the £/tCO2e figure is an upper bound on what the abatement costs, not the cheapest way to buy it. 
         dfs["Carbon"].rename(
             columns={"mac_GBP_per_tco2e": "cost_of_emissions_optimal_design_GBP_per_tco2e"}
         ).to_excel(xw, sheet_name="Carbon Data", index=False)

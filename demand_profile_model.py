@@ -27,7 +27,7 @@ Data layers:
 
 Model parameters:
     - Diurnal temperature amplitude + solar geometry (DIURNAL_AMPLITUDE, SEASON_DOY) — sinusoid
-      fallback only; real ERA5 diurnal shape (data layer (i)) is used whenever a district is passed
+      fallback only; real ERA5 diurnal shape is used whenever a district is passed
     - Heating system COP models (cop_ashp, cop_gshp, HEATING_SYSTEMS)
 
 Pipeline:
@@ -44,12 +44,14 @@ import numpy as np
 import pandas as pd
 import datasets   # ERA5 hourly-temperature diurnal shape (real, vs the sinusoid fallback) reads through here
 import openpyxl   # main() builds the demo workbook; styling/plots live in demand_report.py
+from districts import DISTRICT_STATIONS
+from seasons import MONTH_SEASON, MONTH_DAYS, MONTHS_ORDER
 from model_params import (
     ETA_BOILER, ashp_cop_at_7C, ashp_cop_slope_per_C,
     gshp_cop_at_10C, gshp_cop_slope_per_C,
     T_ASHP_MIN, T_ASHP_MAX, T_GSHP_MIN, T_GSHP_MAX,
     HORIZONTAL_LOOP_DEPTH_M, SOIL_THERMAL_DIFFUSIVITY_M2_S,
-    SURFACE_TEMP_PEAK_DOY, BRINE_OFFSET_C, DEFAULT_BRINE_TEMP_C,
+    SURFACE_TEMP_PEAK_DOY, BRINE_OFFSET_C, DEFAULT_GROUND_TEMP_C,
     EV_CHARGER_KW, EV_SPACE_FRACTION, EV_PARKING_DENSITY, EV_DWELL_HOURS,
     PEAK_FRACTION, T_SETBACK, HDD_BASE, UK_LATITUDE,
     DIURNAL_AMPLITUDE, SEASON_DOY, WE_LOAD_FACTOR,
@@ -57,8 +59,6 @@ from model_params import (
 
 # Run directly as well as import: alias this module's __main__ entry under its real name in 
 # sys.modules before the circular `from demand_report import ...` below runs. 
-# Without this, demand_report's `import demand_profile_model` re-executes this whole file from
-# scratch as a second module instance, which re-triggers the same import mid-definition and fails.
 if __name__ == "__main__":
     sys.modules.setdefault("demand_profile_model", sys.modules[__name__])
 
@@ -110,8 +110,6 @@ ACTIVITY_LOOKUP = {
     },
 }
 
-from districts import DISTRICT_STATIONS  
-
 # Base load (always-on electricity share) derived from BEES 2014-15 Energy Intensity survey)
 BASE_LOAD_CFG = {
     "Health: Health centre":    (slice(141, 148), {"Hot water": 1.0, "Lighting": 0.5}),
@@ -120,23 +118,11 @@ BASE_LOAD_CFG = {
     "Retail: Department store": (slice(300, 307), {"Cooled storage": 1.0, "Cooling & humidification": 1.0, "Fans": 1.0, "Lighting": 0.2}),
 }
 
-# EV demand inputs: EV_PARKING_DENSITY and EV_DWELL_HOURS loaded from data/Model_Parameters.xlsx via model_params
-# Weekend load factors derived from TM46 operational schedules: WE_LOAD_FACTOR loaded from data/Model_Parameters.xlsx via model_params
+# EV demand inputs: EV_PARKING_DENSITY and EV_DWELL_HOURS loaded from data/model_parameters.xlsx via model_params
+# Weekend load factors derived from TM46 operational schedules: WE_LOAD_FACTOR loaded from data/model_parameters.xlsx via model_params
 
 
 # 3 - CALENDAR / SEASON CONSTANTS
-MONTH_SEASON = {
-    "January": "Winter",  "February": "Winter",  "March":     "Spring",
-    "April":   "Spring",  "May":      "Spring",  "June":      "Summer",
-    "July":    "Summer",  "August":   "Summer",  "September": "Autumn",
-    "October": "Autumn",  "November": "Autumn",  "December":  "Winter",
-}
-MONTH_DAYS = {
-    "January":   31, "February": 28, "March":     31, "April":   30,
-    "May":       31, "June":     30, "July":      31, "August":  31,
-    "September": 30, "October":  31, "November":  30, "December": 31,
-}
-MONTHS_ORDER           = list(MONTH_DAYS.keys())
 # First day-of-year of each month. Evaluates 1.5 m ground temperature / brine COP for every calendar day in a month
 MONTH_START_DOY  = {m: 1 + sum(MONTH_DAYS[mm] for mm in MONTHS_ORDER[:i])
                     for i, m in enumerate(MONTHS_ORDER)}
@@ -144,22 +130,11 @@ SEASON_ORDER_BENCHMARK = ["Summer", "Autumn", "Winter", "Peak Winter", "Spring"]
 SEASON_ORDER_DEMAND    = ["Spring", "Summer", "Autumn", "Winter", "Peak Winter"]  # Demand Outputs sheet
 MAIN_SEASONS           = ["Summer", "Autumn", "Winter", "Spring"]                 # excludes Peak Winter
 
-# Solar geometry drives the intra-day temperature shape only. Electricity demand takes no intra-day
-# daylight shape: the sunshine-derived light factor scales a month's non-base electricity as a whole
-# (see _season_context), while occupancy alone distributes it within the day.
-# DIURNAL_AMPLITUDE only drives temperature, and only used when no district is passed to hourly_temp_profile(),
-# or ERA5 data is unavailable for it, otherwise the real ERA5 diurnal anomaly is used instead.
-# Sinusoid source: UK Met Office climate statistics; consistent with CIBSE Guide A §2.3.
-
-# Heat-demand intra-day shape: the day's heat is distributed by both temperature and occupancy.
-# Occupancy raises the indoor target (setback↔setpoint) while ERA5 diurnal temperature sets the gradient.
-# Falls back to an occupancy-only shape (floored at a flat setback level) when no heating is needed all day.
-
 
 # 4 - PHYSICAL / NUMERICAL CONSTANTS
 REFERENCE_DISTRICT = "England SE and Central S"   # CIBSE benchmarks assumed for London Heathrow
 
-# Ground-loop thermal model (Banks 2008 §3.3, §8.1, §8.5)
+# Ground-loop thermal model 
 # Damping depth d = sqrt(2·α/ω); ω = 2π/year. Seasonal signal attenuates as exp(-z/d) and lags by z/d radians.
 _OMEGA_YR                     = 2.0 * np.pi / (365.25 * 86400.0)
 DAMPING_DEPTH_M               = np.sqrt(2.0 * SOIL_THERMAL_DIFFUSIVITY_M2_S / _OMEGA_YR)   
@@ -174,15 +149,17 @@ def cop_ashp(t_ext: float) -> float:
     t = max(T_ASHP_MIN, min(T_ASHP_MAX, t_ext))
     return ashp_cop_at_7C + ashp_cop_slope_per_C * (t - 7.0)
 
-def cop_gshp(t_brine: float = DEFAULT_BRINE_TEMP_C) -> float:
+def cop_gshp(t_brine: float = DEFAULT_GROUND_TEMP_C - BRINE_OFFSET_C) -> float:
     """Ground-source heat pump COP at brine inlet temperature t_brine (°C).
+    Note the argument is a BRINE temperature, not a ground temperature: the default derives it
+    from the undisturbed ground temp, exactly as brine_temperature() does.
     Slope from Company 1's 49-75 kW commercial unit in CEP Technology Library v1.02, HP ground-water (Heating) sheet."""
     t = max(T_GSHP_MIN, min(T_GSHP_MAX, t_brine))
     return gshp_cop_at_10C + gshp_cop_slope_per_C * (t - 10.0)
 
 def daily_ground_temperature(annual_mean_T_C: float, surface_amplitude_C: float,
                              day_of_year: int, depth_m: float = HORIZONTAL_LOOP_DEPTH_M) -> float:
-    """Soil temperature at given depth and DOY from 1-D heat conduction with sinusoidal annual surface boundary (Banks 2008 §3.3, Figure 3.3).
+    """Soil temperature at given depth and DOY from 1-D heat conduction with sinusoidal annual surface boundary.
     At z = 1.5 m: amplitude ≈ 54% of surface, phase lag ≈ 35 days; At z ≳ 5·DAMPING_DEPTH (~12 m): seasonal signal < 1%, T ≈ annual mean."""
     z = depth_m
     d = DAMPING_DEPTH_M
@@ -194,25 +171,24 @@ def daily_ground_temperature(annual_mean_T_C: float, surface_amplitude_C: float,
 def brine_temperature(annual_mean_T_C: float, surface_amplitude_C: float,
                       day_of_year: int, loop_type: str) -> float:
     """Horizontal loops at 1.5 m carry seasonal ground-temperature variation; 
-    vertical boreholes (≥80 m depth) effectively have constant brine temperatures at annual mean ground T year-round (Banks 2008 Figure 3.5)."""
+    vertical boreholes (≥80 m depth) effectively have constant brine temperatures at annual mean ground T year-round."""
     if loop_type == "horizontal":
         ground_T = daily_ground_temperature(annual_mean_T_C, surface_amplitude_C, day_of_year)
     else:
         ground_T = annual_mean_T_C
     return ground_T - BRINE_OFFSET_C
 
-# GSHP "cop" lambda is only a fallback for callers that don't supply a district to _breakdown. When `district` is passed, 
-# _breakdown computes brine_temperature(..., loop_type) → cop_gshp(t_brine) directly using district_climate_stats[district].
 HEATING_SYSTEMS = {
     "Gas Boiler":        {"is_heat_pump": False, "cop": None,                "loop_type": None},
     "ASHP":              {"is_heat_pump": True,  "cop": cop_ashp,            "loop_type": None},
-    "GSHP (vertical)":   {"is_heat_pump": True,  "cop": lambda _t: cop_gshp(DEFAULT_BRINE_TEMP_C - BRINE_OFFSET_C), "loop_type": "vertical"},
-    "GSHP (horizontal)": {"is_heat_pump": True,  "cop": lambda _t: cop_gshp(DEFAULT_BRINE_TEMP_C - BRINE_OFFSET_C), "loop_type": "horizontal"},
+    # Both loop types default to the annual-mean brine inlet (undisturbed ground temp less the offset).
+    "GSHP (vertical)":   {"is_heat_pump": True,  "cop": lambda _t: cop_gshp(), "loop_type": "vertical"},
+    "GSHP (horizontal)": {"is_heat_pump": True,  "cop": lambda _t: cop_gshp(), "loop_type": "horizontal"},
 }
 HEATING_OPTIONS = list(HEATING_SYSTEMS)
 
 
-# 7 - MODULE-LEVEL STATE (populated by initialize(); None until then)
+# 6 - MODULE-LEVEL STATE (populated by initialize(); None until then)
 cibse_dashboard         = None   # {activity: {electricity_typical, fossil_typical, description, category, source}}
 ncm_occupancy           = None   # {activity: 24-hour occupancy fraction list}
 ncm_setpoints           = None   # {activity: area-weighted heating setpoint °C}
@@ -227,7 +203,7 @@ reference_daily_hdd     = None   # daily HDD for REFERENCE_DISTRICT
 district_climate_stats  = None   # {district: {annual_mean_T_C, surface_amplitude_C}} — for GSHP ground-temp model
 
 
-# 8 - DATA LAYER CALCULATIONS
+# 7 - DATA LAYER CALCULATIONS
 def solar_elevation_profile(season: str, latitude: float = UK_LATITUDE) -> np.ndarray:
     """24-element relative solar availability (solar noon = 1) for the mid-season day of year."""
     doy      = SEASON_DOY[season]
@@ -243,13 +219,9 @@ def solar_elevation_profile(season: str, latitude: float = UK_LATITUDE) -> np.nd
 
 def hourly_temp_profile(t_mean: float, season: str, latitude: float = UK_LATITUDE,
                         district: str = None) -> np.ndarray:
-    """24-element hourly dry-bulb temperature [°C] swinging around the daily mean `t_mean`.
-
-    Shape source (HDD owns the level, temperature owns the shape):
-      - When `district` is given AND ERA5 profiles exist, use the REAL mean diurnal anomaly for that
-        (district, season) from api_temperature_profiles.xlsx:
-      - Otherwise fall back to the idealised sinusoid T(h) = t_mean + A·cos(2π(h-peak)/24), peak ~2 h
-        after solar noon, amplitude DIURNAL_AMPLITUDE[season] — phase from solar geometry only."""
+    """Solar geometry drives the intra-day temperature shape only; intra-day electricity is
+    occupancy-driven instead. The DIURNAL_AMPLITUDE sinusoid is used only when no district is 
+    passed or ERA5 data is unavailable; otherwise the real ERA5 diurnal anomaly is used."""
     if district is not None:
         anomaly = datasets.get_temperature_anomaly(district, season)
         if anomaly is not None:
@@ -262,11 +234,7 @@ def hourly_temp_profile(t_mean: float, season: str, latitude: float = UK_LATITUD
     return t_mean + a * np.cos(2 * np.pi * (h - peak_h) / 24)
 
 def _ev_capacity_kw(activity: str) -> float:
-    """Installed EV charging capacity [kW/m²] — nameplate, not a peak demand.
-
-    ev_profile_48 supplies the utilisation fraction (peaks at 0.526), so the actual half-hourly
-    peak demand is this × 0.526, not this.
-    """
+    """Installed EV charging capacity [kW/m²]."""
     util = min(1.0, EV_DWELL_HOURS[activity] / 8.0)
     return EV_PARKING_DENSITY[activity] * EV_SPACE_FRACTION * EV_CHARGER_KW * util
 
@@ -279,13 +247,12 @@ def ev_annual_kwh_per_sqm(activity: str) -> float:
     return float(_ev_capacity_kw(activity) * ev_profile_48.sum() * 0.5 * 365)
 
 
-# 9 - CORE DEMAND CALCULATIONS
+# 8 - CORE DEMAND CALCULATIONS
 # lru_cache enables memoisation of intermediate results for each combination.
 @functools.lru_cache(maxsize=None)
 def _season_context(activity: str, season: str, daily_hdd: float,
                     seasonal_hdd: float, light_fac: float, district: str = None) -> dict:
-    """Per-season intermediate factors used by the demand breakdown.
-    `district` selects the ERA5 diurnal temperature for the degree-hour heat shape; None keeps synthetic-sinusoid temperature."""
+    """Per-season intermediate factors used by the demand breakdown."""
     e            = cibse_dashboard[activity]["electricity_typical"]
     f            = cibse_dashboard[activity]["fossil_typical"]
     e_adj        = tm46_adjustment[activity]["elec"]
@@ -308,11 +275,8 @@ def _season_context(activity: str, season: str, daily_hdd: float,
     # Fall back to the occupancy shape when no heating is needed all day.
     heat_norm    = heat_h / heat_h.sum() if heat_h.sum() > 1e-9 else heat_norm
     uniform      = np.ones(24) / 24
-    # light_fac (normalised so the day-weighted annual mean = 1.0) redistributes the non-base
-    # electricity BETWEEN months — dark months draw more, bright months less — without changing the
-    # annual total. It scales the day's energy only; WITHIN the day the shape is occupancy alone.
-    # Commercial buildings are lit throughout trading hours regardless of daylight unless fitted with
-    # daylight-dimming control, which is not assumed here, so solar elevation sets no intra-day shape.
+    # light_fac (normalised so day-weighted annual mean = 1.0) redistributes non-base electricity between months without changing the annual total. 
+    # Intra-day shape is driven by occupancy alone.
     d_base       = e * e_base * (1 - e_adj) / 365
     d_occ_base   = e * (1 - e_base) * (1 - e_adj) * light_fac / 365
     d_dd_elec    = e * e_adj * hdd_ratio * (seasonal_hdd / daily_hdd) / 365
@@ -329,15 +293,13 @@ def _breakdown(activity: str, heating: str, season: str, daily_hdd: float,
                district: str = None) -> dict:
     """Half-hourly kW/m² split into end-use components.
     For GSHP, if `district` is supplied the heat-pump COP is derived from the per-(district, season, loop-type) brine inlet temperature 
-    via `brine_temperature()` and `cop_gshp()`. Otherwise the heat-pump COP function from HEATING_SYSTEMS is used (ASHP uses outdoor air; 
-    GSHP falls back to the annual-mean brine inlet DEFAULT_BRINE_TEMP_C − BRINE_OFFSET_C == COP ≈ 2.95)."""
+    via `brine_temperature()` and `cop_gshp()`. Otherwise the heat-pump COP function from HEATING_SYSTEMS is used."""
     c = _season_context(activity, season, daily_hdd, seasonal_hdd, light_fac, district)
     f, f_adj                       = c["F"], c["F_adj"]
     seasonal_HDD, hdd_ratio, t_ext = c["seasonal_HDD"], c["hdd_ratio"], c["T_ext"]
     occ_norm, heat_norm, uniform   = c["occ_norm"], c["heat_norm"], c["uniform"]
     d_base, d_occ_base, d_dd_elec  = c["D_base"], c["D_occ_base"], c["D_dd_elec"]
 
-    # d_occ_base already carries the month's light factor; occupancy sets the intra-day shape.
     lsp_kW  = d_base * uniform + d_occ_base * occ_norm
     hvac_kW = d_dd_elec * occ_norm
 
@@ -380,8 +342,6 @@ def _breakdown(activity: str, heating: str, season: str, daily_hdd: float,
 def half_hourly_kw_per_sqm_breakdown(activity: str, heating: str, season: str,
                                      degree_days: dict, daily_hdd: float,
                                      district: str = None) -> dict:
-    """Public wrapper: dict-keyed lookup → cached implementation.
-    Pass `district` to enable GSHP COP variation by district / season / loop type."""
     s = degree_days[season]
     return _breakdown(activity, heating, season, daily_hdd,
                       s["hdd_per_day"], s["light_factor"], district)
@@ -452,6 +412,14 @@ def peak_scale_factor(activity: str, heating: str, degree_days: dict, daily_hdd:
     s = degree_days["Peak Winter"]
     return _peak_scale_factor(activity, heating, daily_hdd, s["hdd_per_day"], s["light_factor"], district)
 
+def wd_we_factors(activity: str) -> tuple:
+    """(weekday, weekend) multipliers on a day-type-agnostic daily profile for `activity`.
+    Weekend load factor f = WE_LOAD_FACTOR[activity]; wd = 7/(5+2f) and we = wd*f."""
+    f      = WE_LOAD_FACTOR[activity]
+    wd_fac = 7.0 / (5.0 + 2.0 * f)
+    return wd_fac, wd_fac * f
+
+
 def sample_buildings() -> list:
     """All (activity × heating) sample buildings."""
     out = []
@@ -491,7 +459,7 @@ def seasonal_demand_kwh(activity: str, heating: str, season: str, floor_area: fl
             round(sum(kwh["gas"])         * n))
 
 
-# 10. LOADERS 
+# 9 - LOADERS
 # (a) CIBSE annual energy benchmarks (typical kWh/m²/y per activity)
 def load_cibse_dashboard(xl: pd.ExcelFile) -> dict:
     df = xl.parse("CIBSE Dashboard", header=0)
@@ -584,17 +552,7 @@ def load_base_load_fracs(xl: pd.ExcelFile, verbose: bool = False) -> dict:
 
 # (f) UKPN EV charging utilisation profile
 def load_ev_profile(xl: pd.ExcelFile) -> np.ndarray:
-    """48-slot half-hourly EV charging utilisation [fraction of rated capacity] from the UKPN dataset.
-
-    The UKPN 'Standard Profiles ... for Electricity Demand' columns are already percentages of RATED
-    CAPACITY (0–100), not measured demand — the sheet's `Non_variable` column is a constant 100.0.
-    So the correct conversion is /100, NOT /max(): the series carries its own absolute level, and
-    peak-normalising would discard it. Averaged over all 365 days of 2019; EV charging is essentially
-    flat across the week (weekend/weekday mean ratio 1.030), so no weekday/weekend split is applied
-    here — adding one would impose a swing the source data does not show.
-
-    Resulting profile peaks at 0.526 and averages 0.348 of rated capacity.
-    """
+    """48-slot half-hourly EV charging utilisation [fraction of rated capacity] from the UKPN dataset."""
     df = xl.parse("UKPN - EV Profiles")
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True)
     df["slot"] = df["Timestamp"].dt.hour * 2 + (df["Timestamp"].dt.minute >= 30).astype(int)
@@ -602,7 +560,6 @@ def load_ev_profile(xl: pd.ExcelFile) -> np.ndarray:
     return raw / 100.0
 
 # (g) Met Office sunshine hours to derive a monthly lighting factor (per district)
-#
 # Each month's sunshine is averaged over the last datasets.SUNSHINE_BASELINE_YEARS complete years 
 # (default 10 -> 2016-2025) so the factor is not driven by an anomalous single year.
 MONTH_COL = {"January": "jan", "February": "feb", "March":     "mar", "April":   "apr",
@@ -617,8 +574,7 @@ def load_light_factors(verbose: bool = False) -> dict:
 
     for district in DISTRICT_STATIONS:
         df = datasets.get_sunshine(district)
-        # Coerce the monthly columns to numeric ("---"/blanks -> NaN), drop incomplete years
-        # (e.g. the partial latest year), then average the last n_years complete rows per month.
+        # Coerce the monthly columns to numeric, drop incomplete years, then average the last n_years complete rows per month.
         cols = [c for c in MONTH_COL.values() if c in df.columns]
         df   = df.copy()
         df[cols] = df[cols].apply(pd.to_numeric, errors="coerce")
@@ -650,7 +606,7 @@ def load_light_factors(verbose: bool = False) -> dict:
 def load_degree_days(raw_lf: dict, icao: str):
     """Returns (seasonal_stats, annual_daily_hdd, monthly_stats) for one district's ICAO station.
     Uses the last datasets.HDD_BASELINE_YEARS calendar years of available HDD data; seasonal/monthly
-    means average across those years (per-day means, so partial boundary years are handled correctly)."""
+    means average across those years."""
     df = datasets.get_degree_days(icao, last_years=datasets.HDD_BASELINE_YEARS)
     df["month"] = df["date"].dt.month
 
@@ -674,8 +630,7 @@ def load_degree_days(raw_lf: dict, icao: str):
     # Peak Winter = single coldest half-hour; magnitude later scaled to PEAK_FRACTION of annual
     stats["Peak Winter"] = {"hdd_per_day": round(float(df["hdd"].max()), 4), "n_days": 1}
 
-    # Lighting factors are monthly. Normalise so the day-weighted mean across the 12 months = 1.0, 
-    # redistributing lighting load across the year without changing the annual total. 
+    # Normalise monthly lighting factors so the day-weighted mean across the 12 months = 1.0.
     year_days  = sum(MONTH_DAYS[m] for m in MONTHS_ORDER)
     wt_avg     = sum(raw_lf[m] * MONTH_DAYS[m] for m in MONTHS_ORDER) / year_days
     month_lf   = {m: round(raw_lf[m] / wt_avg, 4) for m in MONTHS_ORDER}
@@ -790,16 +745,12 @@ def main():
     out_path = os.path.join(run_dir, "Demand Profiles.xlsx")
     wb.save(out_path)
     print(f"Saved: {out_path}")
-
-    # The workbook covers the selected cell, but the charts cover the whole model: one demand
-    # profile exists per (district, activity class), so a single cell's chart is not
-    # representative. Always render the full set into one demand/ folder.
     print("\nGenerating demand plots (all districts × activity classes) …")
     generate_all_demand_plots(run_dir)
 
-# Imported at the bottom to avoid circular import (demand_report imports this module for the physics).
+# Imported at the bottom to avoid circular import.
 from demand_report import (
-    build_benchmark_sheet, build_demand_sheet, generate_demand_plots, generate_all_demand_plots
+    build_benchmark_sheet, build_demand_sheet, generate_all_demand_plots
     )
 
 

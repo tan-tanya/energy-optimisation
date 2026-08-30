@@ -1,38 +1,28 @@
 """
-Import-only, by optimisation_model.py (main()) once the cost rounds complete; it is handed
-every solved round. Scenarios are re-derived per round key via om._scenarios_for_round(),
-so the caller's dict keys decide the price sets the bisections re-solve under.
+Import-only, by optimisation_model.py (main()) once the cost rounds complete.
 
-Back-calculates the required capex rebate (or electricity price cut) ONCE PER ACTIVITY CLASS, each
-in that class's own best-NPV district, so a recommendation can be targeted by end-user type and by
-location rather than read off one headline cell. For every such cell it searches until:
+Back-calculates the required capex rebate or electricity price cut ONCE PER ACTIVITY CLASS, 
+for each class's own best-NPV district, so a recommendation can be targeted by end-user type and location. 
 
+For every such cell it searches until:
   1. Battery storage becomes NPV-recommended.
-  2. Heat pumps become the cheapest heating technology via a CAPEX rebate, undercutting the Gas Boiler cost.
-  3. Heat pumps become the cheapest heating technology via an electricity import PRICE cut:
-     Uniform % reduction applied to the wholesale+DUoS import-price build-up, using two capex anchors —
-     0% and 100% HP capex rebate. Gas Boiler is re-solved under the same price cut to ensure fair comparison.
-  4. Battery storage becomes NPV-recommended on a raised SEG EXPORT price alone (search variable is a
-     multiple of today's export price). Deliberately independent of levers 1-3: no battery/HP capex
-     rebate and no import-price cut are applied, so the row answers "what can export price do by
-     itself?". Because a flat export tariff pays a battery nothing for shifting export to export, the
-     search often runs to its ceiling without installing one — so what the higher price DOES buy
-     (PV size, export volume, NPV) is recorded at the tested multiple either way.
+  2. Heat pumps become the cheapest heating technology via a CAPEX rebate (undercutting the Gas Boiler cost).
+  3. Heat pumps become the cheapest heating technology via an electricity import price cut:
+     Uniform % reduction applied to the import price, using two capex anchors — 0% and 100% HP capex rebate. 
+     Gas Boiler is re-solved under the same price cut to ensure fair comparison.
+  4. Battery storage becomes NPV-recommended on a raised SEG export price alone, as a multiple of today's export price. 
+     Independent of levers 1-3. 
 
 Plus one step-wise sweep (fixed steps, no search):
+  5. Battery capex grant swept 0% -> 100% in batt_sweep_step increments (default 5%). 
+     Shows how much storage each further increment buys, what the grant costs per kWh installed,
+     and how much of that grant spend comes back as NPV gain to the end user. 
+     Set batt_sweep_step=0 to skip.
 
-  5. Battery capex grant swept 0% -> 100% in batt_sweep_step increments (default 5%, so 21 solves per
-     round). Where target 1 stops at the threshold where a battery first appears, this carries on past
-     it to show how much storage each further increment buys, and what the grant costs per kWh
-     installed. Set batt_sweep_step=0 to skip it — it dominates this module's runtime.
-
-Outputs, per round: one tab per lever (rows = activity classes), a Summary tab pivoting every lever
-against activity class, and a Charts tab holding policy_thresholds_<round>.png and
-battery_capex_sweep_<round>.png (also written to the charts/ subfolder beside the workbook).
-
-Runtime scales with the number of classes covered: ~285 solves per round for all four. Scope it with
-`activities=[...]`, thin the sweep with `batt_sweep_step`, or raise `n_jobs` (the default logical//4
-predates the per-class loop and is likely low now that a round holds ~104 tasks).
+Outputs, per round: 
+- One tab per lever (rows = activity classes)
+- Summary tab pivoting every lever against activity class
+- Charts tab (also written to the charts/ subfolder beside the workbook).
 
 Run_policy_recommendations(cost_rounds, out_path, *, districts=None, activities=None,
                            time_limit_s=None, max_iter=10, tol=0.05, n_jobs=None, verbose=True,
@@ -43,26 +33,24 @@ Run_policy_recommendations(cost_rounds, out_path, *, districts=None, activities=
 import os
 import multiprocessing as mpr
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 from openpyxl.drawing.image import Image as XLImage
 
 import model_params as mp
+from optimisation_config import resolve_jobs
 
 _BATT_KEYS = ("energy_capex_per_kwh", "power_capex_per_kw")
-_BATT_INSTALL_THRESHOLD_KWH = 1.0   # ignore sub-kWh noise around zero when deciding "installed"
+_BATT_INSTALL_THRESHOLD_KWH = 1.0   # minimum kWh for battery to be considered "installed"
 _HP_HEATINGS = ("ASHP", "GSHP (vertical)", "GSHP (horizontal)")
-# Ceiling of the export-price search, as a multiple of today's active SEG price. 5x (GBP 0.50/kWh at
-# the current GBP 0.10 SEG) is already well past any tariff a UK supplier has offered and past the
-# import price, so reaching it is the answer "export price cannot do this", not a call to search
-# higher. The old 10x ceiling only mattered while export could be resold grid-to-grid; the
-# ex_gen_* export cap in optimisation_engine now bounds export by own generation, so the extra
-# search range bought nothing but solve time.
-_EXPORT_MAX_MULTIPLE = 5.0
-# Battery capex sweep: fixed grant steps from 0% to 100%. The bisection levers stop at the threshold
-# where the target first flips; this sweep keeps going past it to show how much battery each further
-# increment of grant actually buys (and what it costs the grant-giver per kWh installed).
+# Ceiling of the export-price search, as a fraction of the cell's OWN electricity import price.
+# Kept below the import price to prevent model from engaging in grid-to-grid resale.
+_EXPORT_CEILING_FRAC_OF_IMPORT = 0.95
+# Fallback if a cell carries no import price.
+_EXPORT_MAX_MULTIPLE_FALLBACK = 2.5
+# Battery capex sweep: fixed grant steps from 0% to 100%. 
 _BATT_SWEEP_STEP = 0.05
 
 
@@ -90,9 +78,7 @@ def _hp_rebate(heating: str, frac: float):
 
 @contextmanager
 def _export_price_multiple(mult: float):
-    # Scales the year-0 SEG export price; the escalation path and every other price are untouched.
-    # optimisation_engine imported TECH_COSTS from model_params by reference, so writing the key here
-    # is visible to export_price() in the engine — same mechanism as _battery_rebate above.
+    # Scales the year-0 SEG export price.
     base = mp.TECH_COSTS["elec_export_price"]
     try:
         mp.TECH_COSTS["elec_export_price"] = base * mult
@@ -121,8 +107,7 @@ def _elec_price_cut(frac: float):
 
 
 def _bisect_frac(test, *, lo: float = 0.0, hi: float = 1.0, max_iter: int = 10, tol: float = 0.05):
-    # hit=False means even a 100% rebate (hi) fails — the target is blocked by 
-    # something rebate can't fix (e.g. a grid-import ceiling), not by capex.
+    # hit=False means even a 100% rebate (hi) fails.
     if test(lo):
         return lo, True
     if not test(hi):
@@ -138,7 +123,7 @@ def _bisect_frac(test, *, lo: float = 0.0, hi: float = 1.0, max_iter: int = 10, 
     return hi, True
 
 
-def _battery_row(om, district: str, activity: str, heating: str, *, scenarios, time_limit_s,
+def _battery_row(oe, district: str, activity: str, heating: str, *, scenarios, time_limit_s,
                  threads, max_iter, tol, baseline_e_batt: float) -> dict:
     base_energy = mp.TECH_COSTS["battery"]["energy_capex_per_kwh"]
     base_power  = mp.TECH_COSTS["battery"]["power_capex_per_kw"]
@@ -146,7 +131,7 @@ def _battery_row(om, district: str, activity: str, heating: str, *, scenarios, t
 
     def test(frac):
         with _battery_rebate(frac):
-            r = om.solve_scenario(district, activity, heating, scenarios=scenarios,
+            r = oe.solve_scenario(district, activity, heating, scenarios=scenarios,
                                   time_limit_s=time_limit_s, threads=threads)
         cache[frac] = r
         return r.get("status") == "Optimal" and (r.get("e_batt_kwh") or 0.0) > _BATT_INSTALL_THRESHOLD_KWH
@@ -166,19 +151,18 @@ def _battery_row(om, district: str, activity: str, heating: str, *, scenarios, t
     }
 
 
-def _batt_sweep_row(om, district: str, activity: str, heating: str, frac: float, *, scenarios,
+def _batt_sweep_row(oe, district: str, activity: str, heating: str, frac: float, *, scenarios,
                     time_limit_s, threads, baseline_e_batt: float) -> dict:
-    # One fixed grant step — no search. Every step is its own task so the worker pool spreads them.
+    # One fixed grant step.
     base_energy = mp.TECH_COSTS["battery"]["energy_capex_per_kwh"]
     base_power  = mp.TECH_COSTS["battery"]["power_capex_per_kw"]
     with _battery_rebate(frac):
-        r = om.solve_scenario(district, activity, heating, scenarios=scenarios,
+        r = oe.solve_scenario(district, activity, heating, scenarios=scenarios,
                               time_limit_s=time_limit_s, threads=threads)
     e_batt = r.get("e_batt_kwh") or 0.0
     o_batt = r.get("o_batt_kw") or 0.0
     installed = r.get("status") == "Optimal" and e_batt > _BATT_INSTALL_THRESHOLD_KWH
-    # What the grant costs the giver at this step: the discount, charged on the size actually built.
-    # Zero when nothing is built, however deep the discount — a grant nobody takes up costs nothing.
+    # What the grant costs the giver at this step.
     grant_cost = frac * (base_energy * e_batt + base_power * o_batt)
     return {
         "district": district, "activity": activity, "heating": heating,
@@ -190,7 +174,7 @@ def _batt_sweep_row(om, district: str, activity: str, heating: str, frac: float,
         "e_batt_kwh": r.get("e_batt_kwh"),
         "o_batt_kw": r.get("o_batt_kw"),
         "grant_cost_GBP": round(grant_cost, 0),
-        # Grant spend per kWh of storage it brings into existence — the lever's cost-effectiveness.
+        # Grant spend per kWh of storage it brings into existence..
         "grant_cost_GBP_per_kwh_installed": round(grant_cost / e_batt, 1) if installed else np.nan,
         "pv_kwp": r.get("pv_kwp"),
         "annual_batt_disc_kwh": r.get("annual_batt_disc_kwh"),
@@ -202,32 +186,41 @@ def _batt_sweep_row(om, district: str, activity: str, heating: str, frac: float,
     }
 
 
-def _export_row(om, district: str, activity: str, heating: str, *, scenarios, time_limit_s,
-                threads, max_iter, tol, baseline_e_batt: float, baseline_npv_savings: float) -> dict:
-    # Search variable is a multiple of today's export price, applied on its own — no capex rebate and
-    # no import-price cut — so this row is readable as a standalone policy lever.
+def _export_ceiling_multiple(base_price: float, import_price: float) -> float:
+    # Highest export-price multiple the search may test, as a multiple of today's SEG price.
+    if not import_price or not np.isfinite(import_price) or base_price <= 0:
+        return _EXPORT_MAX_MULTIPLE_FALLBACK
+    return max(1.0, _EXPORT_CEILING_FRAC_OF_IMPORT * import_price / base_price)
+
+
+def _export_row(oe, district: str, activity: str, heating: str, *, scenarios, time_limit_s,
+                threads, max_iter, tol, baseline_e_batt: float, baseline_npv_savings: float,
+                import_price: float = None) -> dict:
+    # Applied as a standalone policy instrument.
     base_price = mp.TECH_COSTS["elec_export_price"]
+    ceiling = _export_ceiling_multiple(base_price, import_price)
     cache = {}
 
     def test(mult):
         with _export_price_multiple(mult):
-            r = om.solve_scenario(district, activity, heating, scenarios=scenarios,
+            r = oe.solve_scenario(district, activity, heating, scenarios=scenarios,
                                   time_limit_s=time_limit_s, threads=threads)
         cache[mult] = r
         return r.get("status") == "Optimal" and (r.get("e_batt_kwh") or 0.0) > _BATT_INSTALL_THRESHOLD_KWH
 
-    mult, hit = _bisect_frac(test, lo=1.0, hi=_EXPORT_MAX_MULTIPLE, max_iter=max_iter, tol=tol)
+    mult, hit = _bisect_frac(test, lo=1.0, hi=ceiling, max_iter=max_iter, tol=tol)
     r = cache[mult]
-    # Unlike the rebate levers, the endpoint metrics are reported whether or not the target was hit:
-    # if export price alone buys no battery, what it does buy is the substantive result.
+    # Unlike the rebate levers, endpoint metrics are reported whether or not the target was hit.
     return {
         "district": district, "activity": activity, "heating": heating,
         "baseline_export_price_GBP_per_kwh": round(base_price, 4),
         "baseline_e_batt_kwh": baseline_e_batt,
         "baseline_npv_savings_GBP": baseline_npv_savings,
         "battery_achievable": hit,
-        "search_ceiling_multiple": _EXPORT_MAX_MULTIPLE,
-        "search_ceiling_GBP_per_kwh": round(base_price * _EXPORT_MAX_MULTIPLE, 4),
+        "elec_import_price_GBP_per_kwh": (round(import_price, 4)
+                                          if import_price and np.isfinite(import_price) else None),
+        "search_ceiling_multiple": round(ceiling, 3),
+        "search_ceiling_GBP_per_kwh": round(base_price * ceiling, 4),
         # Threshold multiple when the battery was reached, otherwise the ceiling that was tested.
         "export_price_multiple": round(mult, 3),
         "export_price_GBP_per_kwh": round(base_price * mult, 4),
@@ -239,14 +232,14 @@ def _export_row(om, district: str, activity: str, heating: str, *, scenarios, ti
     }
 
 
-def _hp_row(om, district: str, activity: str, heating: str, target_cost_npv: float, *, scenarios,
+def _hp_row(oe, district: str, activity: str, heating: str, target_cost_npv: float, *, scenarios,
            time_limit_s, threads, max_iter, tol, baseline_cost: float) -> dict:
     base_capex = mp.HEAT_COSTS[heating]["capex_per_kwth"]
     cache = {}
 
     def test(frac):
         with _hp_rebate(heating, frac):
-            r = om.solve_scenario(district, activity, heating, scenarios=scenarios,
+            r = oe.solve_scenario(district, activity, heating, scenarios=scenarios,
                                   time_limit_s=time_limit_s, threads=threads)
         cache[frac] = r
         cost = r.get("total_cost_npv_GBP")
@@ -266,20 +259,17 @@ def _hp_row(om, district: str, activity: str, heating: str, target_cost_npv: flo
     }
 
 
-def _hp_elec_row(om, district: str, activity: str, heating: str, hp_capex_frac: float, *,
+def _hp_elec_row(oe, district: str, activity: str, heating: str, hp_capex_frac: float, *,
                  scenarios, time_limit_s, threads, max_iter, tol, baseline_hp_cost: float,
                  baseline_gas_cost: float) -> dict:
-    # hp_capex_frac is a fixed anchor (0.0 = today's HP capex, 1.0 = free HP capex), not searched;
-    # the search variable is the electricity-price cut. Gas Boiler is re-solved at every step
-    # under the same cut since a price cut isn't HP-specific.
     cache = {}
 
     def test(frac):
         with _elec_price_cut(frac):
             with _hp_rebate(heating, hp_capex_frac):
-                r_hp = om.solve_scenario(district, activity, heating, scenarios=scenarios,
+                r_hp = oe.solve_scenario(district, activity, heating, scenarios=scenarios,
                                          time_limit_s=time_limit_s, threads=threads)
-            r_gas = om.solve_scenario(district, activity, "Gas Boiler", scenarios=scenarios,
+            r_gas = oe.solve_scenario(district, activity, "Gas Boiler", scenarios=scenarios,
                                       time_limit_s=time_limit_s, threads=threads)
         cache[frac] = (r_hp, r_gas)
         hp_cost, gas_cost = r_hp.get("total_cost_npv_GBP"), r_gas.get("total_cost_npv_GBP")
@@ -302,9 +292,7 @@ def _hp_elec_row(om, district: str, activity: str, heating: str, hp_capex_frac: 
 
 
 def _winning_cells_per_activity(df_opt: pd.DataFrame, districts, activities) -> list:
-    # One (district, activity) per activity class: that class's own best-NPV district, so the levers
-    # are answered per end-user type and per location rather than for a single headline cell.
-    # `districts` narrows the candidate locations, `activities` narrows which classes are covered.
+    # One (district, activity) per activity class: each class's own best-NPV district.
     # Returns [] if scoping leaves nothing to pick from.
     scoped = df_opt
     if districts:
@@ -313,56 +301,65 @@ def _winning_cells_per_activity(df_opt: pd.DataFrame, districts, activities) -> 
         scoped = scoped[scoped["activity"].isin(activities)]
     if scoped.empty:
         return []
-    # Ordered by NPV so the strongest class leads the console log and every output tab.
+    # Ordered by NPV.
     best = scoped.loc[scoped.groupby("activity")["npv_savings_GBP"].idxmax()]
     best = best.sort_values("npv_savings_GBP", ascending=False)
     return [(r.district, r.activity) for r in best.itertuples()]
 
 
-def _solve_task(task: tuple) -> dict:
-    import optimisation_model as om
-    kind = task[0]
-    if kind == "battery":
-        (_, round_name, district, activity, heating, scenarios, time_limit_s, threads,
-         max_iter, tol, baseline_e_batt) = task
-        row = _battery_row(om, district, activity, heating, scenarios=scenarios,
-                           time_limit_s=time_limit_s, threads=threads, max_iter=max_iter, tol=tol,
-                           baseline_e_batt=baseline_e_batt)
-    elif kind == "batt_sweep":
-        (_, round_name, district, activity, meta, scenarios, time_limit_s, threads,
-         _max_iter, _tol, baseline_e_batt) = task          # fixed step: nothing is searched
-        heating, frac = meta
-        row = _batt_sweep_row(om, district, activity, heating, frac, scenarios=scenarios,
-                              time_limit_s=time_limit_s, threads=threads,
-                              baseline_e_batt=baseline_e_batt)
-    elif kind == "export":
-        (_, round_name, district, activity, heating, scenarios, time_limit_s, threads,
-         max_iter, tol, baselines) = task
-        baseline_e_batt, baseline_npv_savings = baselines
-        row = _export_row(om, district, activity, heating, scenarios=scenarios,
-                          time_limit_s=time_limit_s, threads=threads, max_iter=max_iter, tol=tol,
-                          baseline_e_batt=baseline_e_batt, baseline_npv_savings=baseline_npv_savings)
-    elif kind == "hp":
-        (_, round_name, district, activity, meta, scenarios, time_limit_s, threads,
-         max_iter, tol, baseline_cost) = task
-        heating, target_cost = meta
-        row = _hp_row(om, district, activity, heating, target_cost, scenarios=scenarios,
-                     time_limit_s=time_limit_s, threads=threads, max_iter=max_iter, tol=tol,
-                     baseline_cost=baseline_cost)
+@dataclass
+class _Task:
+    """One queued lever solve. `meta` and `baseline` carry whatever that lever needs:
+
+      battery     meta = heating                    baseline = baseline e_batt_kwh
+      batt_sweep  meta = (heating, grant fraction)  baseline = baseline e_batt_kwh
+      export      meta = heating                    baseline = (e_batt, npv_savings, import_price)
+      hp          meta = (heating, target cost)     baseline = baseline HP cost NPV
+      hp_elec     meta = (heating, HP capex frac)   baseline = (HP cost NPV, gas cost NPV)
+    """
+    kind: str
+    round_name: str
+    district: str
+    activity: str
+    meta: object
+    scenarios: list
+    time_limit_s: int
+    baseline: object
+    max_iter: int = 10
+    tol: float = 0.05
+    threads: int = None
+
+
+def _solve_task(t: "_Task") -> dict:
+    import optimisation_engine as oe
+    common = dict(scenarios=t.scenarios, time_limit_s=t.time_limit_s, threads=t.threads)
+    search = dict(max_iter=t.max_iter, tol=t.tol)
+    if t.kind == "battery":
+        row = _battery_row(oe, t.district, t.activity, t.meta, **common, **search,
+                           baseline_e_batt=t.baseline)
+    elif t.kind == "batt_sweep":
+        heating, frac = t.meta                      # fixed step: nothing is searched
+        row = _batt_sweep_row(oe, t.district, t.activity, heating, frac, **common,
+                              baseline_e_batt=t.baseline)
+    elif t.kind == "export":
+        baseline_e_batt, baseline_npv_savings, import_price = t.baseline
+        row = _export_row(oe, t.district, t.activity, t.meta, **common, **search,
+                          baseline_e_batt=baseline_e_batt,
+                          baseline_npv_savings=baseline_npv_savings, import_price=import_price)
+    elif t.kind == "hp":
+        heating, target_cost = t.meta
+        row = _hp_row(oe, t.district, t.activity, heating, target_cost, **common, **search,
+                      baseline_cost=t.baseline)
     else:  # "hp_elec"
-        (_, round_name, district, activity, meta, scenarios, time_limit_s, threads,
-         max_iter, tol, baselines) = task
-        heating, hp_capex_frac = meta
-        baseline_hp_cost, baseline_gas_cost = baselines
-        row = _hp_elec_row(om, district, activity, heating, hp_capex_frac, scenarios=scenarios,
-                          time_limit_s=time_limit_s, threads=threads, max_iter=max_iter, tol=tol,
-                          baseline_hp_cost=baseline_hp_cost, baseline_gas_cost=baseline_gas_cost)
-    return {"kind": kind, "round": round_name, **row}
+        heating, hp_capex_frac = t.meta
+        baseline_hp_cost, baseline_gas_cost = t.baseline
+        row = _hp_elec_row(oe, t.district, t.activity, heating, hp_capex_frac, **common, **search,
+                           baseline_hp_cost=baseline_hp_cost, baseline_gas_cost=baseline_gas_cost)
+    return {"kind": t.kind, "round": t.round_name, **row}
 
 
 def _progress_txt(r: dict) -> str:
-    # One-line result for the console: thresholds report the % (or price multiple) they landed on,
-    # the sweep reports what its fixed step bought.
+    # One-line result for the console: % thresholds and report of what was bought by the fixed step. 
     if r["kind"] == "export":
         mult = r.get("export_price_multiple")
         return (f"{mult:g}x export price" if r.get("battery_achievable")
@@ -374,8 +371,7 @@ def _progress_txt(r: dict) -> str:
 
 
 def _batt_sweep_fracs(step: float) -> list:
-    # 0.0 -> 1.0 inclusive. The 0% row is the un-grantsed baseline, kept in the tab as the reference
-    # every other step is read against.
+    # 0.0 -> 1.0 inclusive. 
     if not step or step <= 0:
         return []
     n = int(round(1.0 / step))
@@ -387,70 +383,63 @@ def run_policy_recommendations(cost_rounds: dict, out_path: str, *,
                                time_limit_s: int = None, max_iter: int = 10, tol: float = 0.05,
                                n_jobs: int = None, verbose: bool = True,
                                batt_sweep_step: float = _BATT_SWEEP_STEP) -> dict:
-    # cost_rounds: {"stochastic": df, ...} — the already-solved ranking dataframe(s) for the cost objective, 
-    # as produced by optimisation_model. By the time this module is imported (in optimisation_model.main()), 
-    # optimisation_model has already finished its own module-level setup, so this reverse import is safe.
-    import optimisation_model as om
-    time_limit_s = time_limit_s or om.DEFAULT_TIME_LIMIT_S
+    import optimisation_engine as oe
+    time_limit_s = time_limit_s or oe.DEFAULT_TIME_LIMIT_S
 
     tasks = []
     activity_order = {}          # {round: [activity, ...]} — best-NPV class first, for output order
     for round_name, df in cost_rounds.items():
-        scen = om._scenarios_for_round(round_name)
+        scen = oe.scenarios_for_round(round_name)
         opt = df[df["status"] == "Optimal"]
         cells = _winning_cells_per_activity(opt, districts, activities)
         activity_order[round_name] = [a for _, a in cells]
-        # Every lever below runs once per activity class, on that class's own best-NPV district.
+        # Every lever below runs once per activity class, at each class's best-NPV district.
         for d, a in cells:
             sub = opt[(opt["district"] == d) & (opt["activity"] == a)]
 
             winner = sub.loc[sub["npv_savings_GBP"].idxmax()]
-            tasks.append(("battery", round_name, d, a, winner.heating, scen, time_limit_s, None,
-                         max_iter, tol, winner.get("e_batt_kwh", 0.0)))
-            # Queued before the gas/HP guard below so the export lever still runs on a cell that has
-            # no Gas Boiler or HP counterpart to compare against — it needs neither.
-            tasks.append(("export", round_name, d, a, winner.heating, scen, time_limit_s, None,
-                         max_iter, tol, (winner.get("e_batt_kwh", 0.0),
-                                         winner.get("npv_savings_GBP", np.nan))))
+
+            def queue(kind, meta, baseline, _r=round_name, _d=d, _a=a):
+                tasks.append(_Task(kind=kind, round_name=_r, district=_d, activity=_a, meta=meta,
+                                   scenarios=scen, time_limit_s=time_limit_s, baseline=baseline,
+                                   max_iter=max_iter, tol=tol))
+
+            queue("battery", winner.heating, winner.get("e_batt_kwh", 0.0))
+            queue("export", winner.heating, (winner.get("e_batt_kwh", 0.0),
+                                             winner.get("npv_savings_GBP", np.nan),
+                                             winner.get("elec_import_price_central_GBP", np.nan)))
             for frac in _batt_sweep_fracs(batt_sweep_step):
-                tasks.append(("batt_sweep", round_name, d, a, (winner.heating, frac), scen,
-                             time_limit_s, None, max_iter, tol, winner.get("e_batt_kwh", 0.0)))
+                queue("batt_sweep", (winner.heating, frac), winner.get("e_batt_kwh", 0.0))
 
             gas = sub[sub["heating"] == "Gas Boiler"]
             hp_candidates = sub[sub["heating"].isin(_HP_HEATINGS)]
-            # Skips only this class's HP levers — the other classes still get theirs.
+            # Skips only this class's HP levers.
             if gas.empty or hp_candidates.empty:
                 continue
             target_cost = gas["total_cost_npv_GBP"].iloc[0]
             cheapest_hp = hp_candidates.loc[hp_candidates["total_cost_npv_GBP"].idxmin()]
             heating = cheapest_hp.heating
             baseline_hp_cost = cheapest_hp.total_cost_npv_GBP
-            tasks.append(("hp", round_name, d, a, (heating, target_cost), scen, time_limit_s, None,
-                         max_iter, tol, baseline_hp_cost))
+            queue("hp", (heating, target_cost), baseline_hp_cost)
 
             for hp_capex_frac in (0.0, 1.0):
-                tasks.append(("hp_elec", round_name, d, a, (heating, hp_capex_frac), scen,
-                             time_limit_s, None, max_iter, tol, (baseline_hp_cost, target_cost)))
+                queue("hp_elec", (heating, hp_capex_frac), (baseline_hp_cost, target_cost))
 
     logical = os.cpu_count() or 2
-    if n_jobs is None:
-        n_jobs = max(1, logical // 4)
-    n_jobs = max(1, min(n_jobs, len(tasks) or 1))
-    threads_per_worker = max(1, logical // n_jobs)
-    tasks = [t[:7] + (threads_per_worker,) + t[8:] for t in tasks]
-
     n_total = len(tasks)
+    n_jobs, threads_per_worker = resolve_jobs(n_jobs, n_total)
+    for t in tasks:
+        t.threads = threads_per_worker
+
     rows = []
-    if n_total == 0:
-        rows = []
-    elif n_jobs == 1:
+    if n_total and n_jobs == 1:
         for i, t in enumerate(tasks, 1):
             r = _solve_task(t)
             rows.append(r)
             if verbose:
                 print(f"[{i}/{n_total}] {r['kind']} · {r['round']} · {r['activity']} · "
                       f"{r['district']} -> {_progress_txt(r)}")
-    else:
+    elif n_total:
         if verbose:
             print(f"Solving {n_total} policy tasks (bisections + sweep steps) over "
                   f"{len(set(a for order in activity_order.values() for a in order))} activity "
@@ -468,6 +457,8 @@ def run_policy_recommendations(cost_rounds: dict, out_path: str, *,
         for kind in frames:
             picked = [r for r in rows if r["kind"] == kind and r["round"] == round_name]
             df_kind = pd.DataFrame(picked).drop(columns=["kind", "round"], errors="ignore")
+            if kind == "batt_sweep":
+                df_kind = _add_grant_value_cols(df_kind)
             frames[kind][round_name] = _order_rows(df_kind, kind, activity_order.get(round_name, []))
 
     frames["summary"] = {name: _build_summary(frames, name, activity_order.get(name, []))
@@ -478,9 +469,25 @@ def run_policy_recommendations(cost_rounds: dict, out_path: str, *,
     return frames
 
 
+def _add_grant_value_cols(df: pd.DataFrame) -> pd.DataFrame:
+    # What the grant buys the end user, per pound of spending. 
+    # npv_gain is the end user's NPV improvement over the un-granted case.
+    if df.empty or "npv_savings_GBP" not in df.columns:
+        return df
+    df = df.copy()
+    base = (df[df["rebate_pct"] == 0.0].set_index("activity")["npv_savings_GBP"]
+            if "rebate_pct" in df.columns else pd.Series(dtype=float))
+    df["baseline_npv_savings_GBP"] = df["activity"].map(base)
+    df["npv_gain_GBP"] = (df["npv_savings_GBP"] - df["baseline_npv_savings_GBP"]).round(0)
+    cost = pd.to_numeric(df["grant_cost_GBP"], errors="coerce")
+    # Undefined where the grant bought nothing: no spend, or spend below the install threshold.
+    ok = df["battery_installed"].fillna(False).to_numpy(dtype=bool) & (cost > 0).to_numpy()
+    df["npv_gain_per_grant_pct"] = np.where(ok, (100.0 * df["npv_gain_GBP"] / cost).round(1), np.nan)
+    return df
+
+
 def _order_rows(df: pd.DataFrame, kind: str, activity_order: list) -> pd.DataFrame:
-    # imap_unordered returns rows as they finish; every tab has to read in a stable order —
-    # activity class (best-NPV class first), then the lever's own step column within each class.
+    # Every tab reads activity class (best-NPV class first), then the lever's own step column within each class.
     if df.empty or "activity" not in df.columns:
         return df
     within = {"batt_sweep": "rebate_pct", "hp_elec": "hp_capex_rebate_pct"}.get(kind)
@@ -504,8 +511,7 @@ def _pick(df: pd.DataFrame, activity: str, col: str, where: dict = None):
 
 
 def _build_summary(frames: dict, round_name: str, activity_order: list) -> pd.DataFrame:
-    # One row per activity class, pulled from the lever frames already in memory — no extra solves.
-    # This is the cross-class table the per-end-user-type recommendation is read off.
+    # One row per activity class, pulled from the lever frames already in memory.
     batt  = frames["battery"].get(round_name, pd.DataFrame())
     sweep = frames["batt_sweep"].get(round_name, pd.DataFrame())
     hp    = frames["hp"].get(round_name, pd.DataFrame())
@@ -514,7 +520,6 @@ def _build_summary(frames: dict, round_name: str, activity_order: list) -> pd.Da
 
     out = []
     for a in activity_order:
-        # The sweep's cheapest step that actually builds a battery — the grant a scheme would set.
         s_a = sweep[(sweep["activity"] == a) & sweep["battery_installed"]] if not sweep.empty else pd.DataFrame()
         s_full = sweep[(sweep["activity"] == a) & (sweep["rebate_pct"] == 100.0)] if not sweep.empty else pd.DataFrame()
         out.append({
@@ -531,6 +536,17 @@ def _build_summary(frames: dict, round_name: str, activity_order: list) -> pd.Da
             "e_batt_kwh_at_100pct":             float(s_full["e_batt_kwh"].iloc[0]) if len(s_full) else np.nan,
             "grant_cost_GBP_per_kwh_at_100pct": (float(s_full["grant_cost_GBP_per_kwh_installed"].iloc[0])
                                                  if len(s_full) else np.nan),
+            "grant_cost_GBP_at_100pct":  (float(s_full["grant_cost_GBP"].iloc[0]) if len(s_full) else np.nan),
+            "npv_gain_GBP_at_100pct":    (float(s_full["npv_gain_GBP"].iloc[0]) if len(s_full) else np.nan),
+            # Headline pass-through of the full rebate: pence of end-user NPV per pound of grant.
+            "npv_gain_per_grant_pct_at_100pct": (float(s_full["npv_gain_per_grant_pct"].iloc[0])
+                                                 if len(s_full) else np.nan),
+            # Best any step of the sweep manages.
+            "npv_gain_per_grant_pct_best":      (float(s_a["npv_gain_per_grant_pct"].max())
+                                                 if len(s_a) else np.nan),
+            "npv_gain_per_grant_pct_best_at_rebate_pct": (
+                float(s_a.loc[s_a["npv_gain_per_grant_pct"].idxmax(), "rebate_pct"])
+                if len(s_a) and s_a["npv_gain_per_grant_pct"].notna().any() else np.nan),
             # 2 - HP capex rebate to undercut the gas boiler
             "hp_rebate_achievable":  _pick(hp, a, "rebate_achievable"),
             "hp_capex_rebate_pct":   _pick(hp, a, "rebate_pct"),
@@ -546,15 +562,13 @@ def _build_summary(frames: dict, round_name: str, activity_order: list) -> pd.Da
     return pd.DataFrame(out)
 
 
-# Sheet-name stem per lever, in workbook order. Excel caps sheet names at 31 chars.
+# Sheet-name stem per lever, in workbook order. 
 _SHEET_STEMS = {"summary": "Summary", "battery": "Battery", "batt_sweep": "Battery Sweep",
                 "hp": "HP", "hp_elec": "HP Elec", "export": "Export Price"}
 
 
 def _act_style():
-    # Short activity labels + per-class colours, borrowed from the results report so the policy
-    # charts read as part of the same deck. Imported inside the function: optimisation_report pulls
-    # in the whole model stack, and this module is itself imported from optimisation_model.
+    # Short activity labels + per-class colours.
     import optimisation_report as orp
     return orp.ACT_SHORT, orp.ACT_COLORS
 
@@ -575,8 +589,7 @@ def _build_charts(frames: dict, round_name: str, charts_dir: str) -> list:
     colors = [act_colors.get(act_short.get(a, a), "#4c72b0") for a in summary["activity"]]
     paths = []
 
-    # (1) Thresholds by activity class. The %-denominated levers share a panel; the export-price
-    # multiple gets its own because it is a multiple, not a percentage.
+    # (1) Thresholds by activity class. 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5),
                                    gridspec_kw={"width_ratios": [2.1, 1]})
     pct_levers = [("battery_rebate_pct", "Battery capex rebate", "#4c72b0"),
@@ -589,8 +602,8 @@ def _build_charts(frames: dict, round_name: str, charts_dir: str) -> list:
         pos  = x - 0.4 + width * (k + 0.5)
         ax1.bar(pos, np.nan_to_num(vals), width, label=lbl, color=c)
         for xi, v in zip(pos, vals):
-            # A missing threshold means the lever never reached its target — labelled at the axis so
-            # an absent bar cannot be misread as "no support needed".
+            # A missing threshold means the lever never reached its target;
+            # labelled at the axis so an absent bar cannot be misread as "no support needed".
             if np.isfinite(v):
                 ax1.text(xi, v + 1.5, f"{v:.0f}%", ha="center", va="bottom", fontsize=7.5)
             else:
@@ -605,8 +618,7 @@ def _build_charts(frames: dict, round_name: str, charts_dir: str) -> list:
     mult = pd.to_numeric(summary.get("export_price_multiple", pd.Series(dtype=float)),
                          errors="coerce").to_numpy()
     ok = summary.get("export_battery_achievable", pd.Series([False] * len(summary))).fillna(False).to_numpy(dtype=bool)
-    # Unachievable cells are drawn hatched at the search ceiling: the bar marks where the search
-    # stopped, not a threshold that was found.
+    # Unachievable cells are drawn hatched at the search ceiling.
     ax2.bar(x, np.nan_to_num(mult), 0.6, color=colors,
             hatch=["" if o else "//" for o in ok],
             edgecolor="black", linewidth=0.6)
@@ -628,6 +640,7 @@ def _build_charts(frames: dict, round_name: str, charts_dir: str) -> list:
     # (2) The swept battery grant: what each further increment buys, per class.
     if not sweep.empty:
         fig, (axa, axb) = plt.subplots(1, 2, figsize=(13, 5.5))
+        full_lbls = []      # full-rebate values, stacked in one corner: all four land near zero
         for a in summary["activity"]:
             s = sweep[sweep["activity"] == a].sort_values("rebate_pct")
             if s.empty:
@@ -635,17 +648,33 @@ def _build_charts(frames: dict, round_name: str, charts_dir: str) -> list:
             lbl = act_short.get(a, a)
             c   = act_colors.get(lbl, "#4c72b0")
             axa.plot(s["rebate_pct"], s["e_batt_kwh"], marker="o", ms=3, color=c, label=lbl)
-            inst = s[s["battery_installed"]]
-            axb.plot(inst["rebate_pct"], inst["grant_cost_GBP_per_kwh_installed"],
+            inst = s[s["battery_installed"] & s["npv_gain_per_grant_pct"].notna()]
+            axb.plot(inst["rebate_pct"], inst["npv_gain_per_grant_pct"],
                      marker="o", ms=3, color=c, label=lbl)
+            full = inst[inst["rebate_pct"] == 100.0]
+            if len(full):
+                full_lbls.append((lbl, float(full["npv_gain_per_grant_pct"].iloc[0]), c))
         axa.set_xlabel("Battery capex grant (%)")
         axa.set_ylabel("Recommended storage (kWh)")
         axa.set_title("Storage bought by the grant", fontweight="bold", fontsize=10)
         axa.grid(alpha=0.3)
         axa.legend(fontsize=8)
+        # Break-even: the line a pure transfer would sit on if every granted pound landed as NPV.
+        axb.axhline(100, color="#444444", ls="--", lw=1)
+        axb.text(0.015, 100, "£1 of NPV gain per £1 granted", fontsize=7.5, color="#444444",
+                 va="bottom", transform=axb.get_yaxis_transform())
+        # The full-rebate values all collapse into the bottom-right corner.
+        if full_lbls:
+            box = dict(facecolor="white", edgecolor="none", alpha=0.75, pad=1.0)
+            axb.text(0.985, 0.78, "At a 100% grant:", fontsize=7.5, color="#444444", ha="right",
+                     va="bottom", style="italic", transform=axb.transAxes, bbox=box)
+            for k, (lbl, v, c) in enumerate(full_lbls):
+                axb.text(0.985, 0.78 - 0.045 * (k + 1), f"{lbl} {v:.1f}%", fontsize=7.5, color=c,
+                         ha="right", va="bottom", transform=axb.transAxes, bbox=box)
         axb.set_xlabel("Battery capex grant (%)")
-        axb.set_ylabel("Grant cost per kWh installed (£/kWh)")
-        axb.set_title("What that storage costs the grant-giver", fontweight="bold", fontsize=10)
+        axb.set_ylabel("NPV gain per £1 of grant (%)")
+        axb.set_ylim(0, 118)
+        axb.set_title("What the grant returns as NPV gain", fontweight="bold", fontsize=10)
         axb.grid(alpha=0.3)
         fig.suptitle(f"Battery capex grant sweep by end-user type — {round_name} round",
                      fontweight="bold", fontsize=12)

@@ -1,5 +1,5 @@
 """
-Import-only. 
+Import-only. Maps each Met Office climatological district to a representative city and weather station.
 
 Met Office district names and their external identifiers:
   - icao          → data/hdd/{icao}_HDD_15.5C.csv   (Met Office heating degree-days)
@@ -23,7 +23,6 @@ DISTRICTS = {
     "Scotland W":               {"icao": "EGPK", "ukcp_region": "Western Scotland",    "sunshine_file": "Scotland_W.txt",               "city": "Glasgow Prestwick", "lat": 55.5094, "lon": -4.5867},
 }
 
-# Convenience views derived from the single table above.
 DISTRICT_STATIONS = {d: r["icao"]          for d, r in DISTRICTS.items()}   # district     -> ICAO station
 UKCP_TO_DISTRICT  = {r["ukcp_region"]: d   for d, r in DISTRICTS.items()}   # UKCP region  -> district
 SUNSHINE_FILE     = {d: r["sunshine_file"] for d, r in DISTRICTS.items()}   # district     -> sunshine txt filename

@@ -1,13 +1,8 @@
-"""PV technology sensitivity. Runs as part of the pipeline (optimisation_model.main() calls
-run_pv_sensitivity() after the cost rounds; --skip-pv-sensitivity to opt out), and also standalone
-against the most recent completed run:
+"""PV technology sensitivity. 
+Runs as part of the pipeline (optimisation_model.main() calls run_pv_sensitivity() after the cost rounds), 
+or standalone against the most recent completed run:
     python pv_panel1_sensitivity.py [--limit N] [--time-limit S] [--jobs N]
-
-Prefer the in-pipeline path. This is a FIXED-SIZING re-solve: it pins sizing to the saved design, so
-running it standalone against a run that predates any change to the roof-area cap (or another
-sizing bound) makes every row infeasible — the same trap that blocked the sibling ASHP sensitivity
-between 2026-07-23 and 2026-07-27. Driving it from the run that just finished removes the failure
-mode. This module covers ALL heating systems, so it is ~4x the design count of the ASHP one.
+Note: Running standalone against an earlier run predating a sizing bound change makes every row infeasible. 
 
 Compares the model's current PV spec (CEP Technology Library v1.02, Panels 16-18 average) against
 Panel 1 (low-end) for every Optimal design in the deterministic cost round.
@@ -17,19 +12,11 @@ q_heat_cap, e_th) is fixed at the saved deterministic-round solution and only th
 is re-solved with Panel 1's efficiency / temperature coefficient / module kWp / module area
 substituted for Panels 16-18,
 
-PV is AREA-matched, not count-matched: n_pv is rescaled so the Panel 1 array occupies the same roof
-area as the saved design (a roof-filling design simply re-fills the roof), capped at the Panel 1
-roof limit. Pinning the module count instead would leave 6.9% of the roof empty under Panel 1's
-smaller 1.63 m^2 module and charge that generation shortfall to panel efficiency -- every array in
-this study is area-limited, not weight-limited, so roof area is what must be held fixed. and capex_per_kwp scaled by Panel 1's relative price discount
-(same CEP source/year as Panels 16-18, so internally consistent -- see PRICE_RATIO). This is far
-cheaper than a full sizing+dispatch re-optimisation. Baseline (Panels 16-18) metrics are read
-straight from the saved sweep rows rather than re-solved -- validated against a fresh re-solve for one
-cell on 2026-07-08 (reproduced the saved total_cost_npv_GBP to within GBP 9 on a GBP 4.47m NPV).
+PV is area-matched: n_pv is rescaled so the Panel 1 array occupies the same roof area as the saved design,
+with capex_per_kwh scaled by Panel 1's relative price discount.
 
 Output: <run folder>/pv_panel1_sensitivity.xlsx, one row per design, in the same NPV-savings-ranked
-row order as the source deterministic sweep (the "NPV Data" sheet of
-Optimisation Results (deterministic).xlsx).
+row order as the source deterministic sweep.
 """
 import argparse
 import glob
@@ -43,9 +30,10 @@ from openpyxl.utils import get_column_letter
 
 import demand_profile_model as dm
 import optimisation_engine as oe
+from optimisation_config import resolve_jobs
 
-# CEP Technology Library v1.02, "PV (monocrystalline silicon)" sheet, .DOCS/Technology Library
-# Version 1.02.xlsx. Panels 16-18 (current model default) = eff 20.9%, temp coeff -0.26%/K,
+# CEP Technology Library v1.02, "PV (monocrystalline silicon)" sheet:
+# Panels 16-18 (current model default) = eff 20.9%, temp coeff -0.26%/K,
 # 0.365 kWp, 1.75 m^2, price/Wp mean(GBP0.6389, GBP0.6438, GBP0.7081). Panel 1 (low-end) below.
 PANEL_1 = dict(efficiency=0.1752, temp_coeff_per_C=-0.0040, module_kwp=0.285, module_area_m2=1.63)
 PANEL_1_PRICE_PER_WP = 0.4737
@@ -64,18 +52,14 @@ BASE_RENAME = {
     "lifetime_emissions_tco2e": "base_lifetime_emissions_tco2e",
 }
 
-# Sheet output is trimmed to identifiers + the two headline comparisons (lifetime NPV, lifetime
-# carbon) rather than every intermediate sizing/dispatch column computed above -- those stay
-# available in `out` for anyone extending this script, just not written to the workbook.
 DISPLAY_COLS = [
     "district", "activity", "heating", "panel1_status",
-    "n_pv", "panel1_n_pv",          # count-matched vs area-matched module counts, for audit
+    "n_pv", "panel1_n_pv",          # count-matched vs area-matched module counts
     "base_total_cost_npv_GBP", "panel1_total_cost_npv_GBP", "total_cost_npv_GBP_delta",
     "base_lifetime_emissions_tco2e", "panel1_lifetime_emissions_tco2e", "lifetime_emissions_tco2e_delta",
     "cheap_panel_pays_off",
 ]
 
-# Excel's standard "Good"/"Bad" cell-style colours.
 _RED_FILL   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 _RED_FONT   = Font(color="9C0006")
 _GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -113,19 +97,15 @@ def _latest_run_dir() -> str:
 
 
 def _read_deterministic_rows(run_dir: str) -> pd.DataFrame:
-    # The deterministic sweep rows, straight off the workbook the pipeline writes at the end of a
-    # run — the same frame run_pv_sensitivity() is handed in-process. Only the standalone entry
-    # point needs this; a run interrupted before its workbooks were written has nothing to re-read.
+    # The deterministic sweep rows from the workbook written at the end of a run.
     wb = os.path.join(run_dir, "Optimisation Results (deterministic).xlsx")
     if not os.path.exists(wb):
-        raise FileNotFoundError(f"No deterministic workbook in {run_dir} — the run did not get as "
-                                f"far as writing its workbooks, so there are no rows to re-use.")
+        raise FileNotFoundError(f"No deterministic workbook in {run_dir}.")
     return pd.read_excel(wb, sheet_name="NPV Data")
 
 
 def _pool_init():
-    # Runs once per worker process. Every task this pool ever runs is a Panel-1 solve, so the
-    # PV tech-param swap happens once here rather than per task.
+    # Runs once per worker process, so the Panel 1 PV-spec swap happens once here rather than per task.
     dm.initialize()
     base_capex_per_kwp = oe.TECH_COSTS["pv"]["capex_per_kwp"]
     oe.TECH_COSTS["pv"].update(PANEL_1)
@@ -134,17 +114,9 @@ def _pool_init():
 
 def _area_matched_n_pv(activity: str, n_pv: int, base_module_area_m2: float,
                        base_n_pv_max: int) -> int:
-    # AREA-matched, not COUNT-matched. Every array in this study is roof-area limited (the weight cap
-    # is an order of magnitude looser), so pinning the module COUNT would hand Panel 1 a physically
-    # smaller array -- 1.63 m^2 vs 1.75 m^2 per module is 6.9% of roof left empty -- and charge the
-    # resulting generation shortfall to the panel's efficiency. Holding the occupied ROOF AREA fixed
-    # isolates the panel swap, which is the comparison the sensitivity is meant to make.
+    # AREA-matched, not COUNT-matched
     panel1_n_pv_max = oe.n_pv_max_for_activity(activity)          # recomputed on Panel 1's geometry
     if n_pv >= base_n_pv_max:
-        # The saved design filled its roof. The like-for-like question is then "same roof, which
-        # panel?", so Panel 1 fills the roof too. Scaling-then-flooring would instead lose a module
-        # to truncation on small arrays (the health centre keeps 10 of 11), leaving the very gap
-        # this function exists to close.
         return panel1_n_pv_max
     scaled = int(round(n_pv * base_module_area_m2 / oe.TECH_COSTS["pv"]["module_area_m2"]))
     return max(1, min(scaled, panel1_n_pv_max))                   # never exceed the roof cap
@@ -154,18 +126,12 @@ def _solve_one(task: tuple) -> dict:
     (district, activity, heating, n_pv, e_batt, o_batt, q_heat_cap, e_th,
      base_module_area_m2, base_n_pv_max, threads, time_limit_s) = task
     n_pv_matched = _area_matched_n_pv(activity, n_pv, base_module_area_m2, base_n_pv_max)
-    prob, V = oe.build_milp(district, activity, heating,
+    prob, V = oe.build_lp(district, activity, heating,
                             objective="cost", scenarios=[oe.central_scenario()])
     prob += V["n_pv"]       == n_pv_matched, "fix_n_pv_area_matched"
     prob += V["e_batt"]     == e_batt,     "fix_e_batt"
     prob += V["o_batt"]     == o_batt,     "fix_o_batt"
-    # q_heat_cap/e_th are floors, not equalities: the saved rows round both to 1 dp
-    # (optimisation_engine.py:1075-6), and heat capacity is normally sized to exactly match peak
-    # heat demand at the cost optimum -- a rounded-down value can land fractionally below what's
-    # physically required, which is infeasible regardless of the PV swap (confirmed by bisecting
-    # the fixed constraints on a failing cell: infeasibility appeared as soon as q_heat_cap was
-    # pinned by ==, before e_th was even added). A >= floor costs at most a rounding error's worth
-    # of extra heat capacity/store if the solver needs it, and is a no-op otherwise.
+    # Floors, not equalities to prevent infeasibility from rounding. 
     prob += V["q_heat_cap"] >= q_heat_cap, "floor_q_heat_cap"
     prob += V["e_th"]       >= e_th,       "floor_e_th"
     solver = oe._make_solver(solver_msg=False, time_limit_s=time_limit_s, threads=threads)
@@ -178,15 +144,6 @@ def _solve_one(task: tuple) -> dict:
 
 def run_pv_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: int = 600,
                        n_jobs: int = None, limit: int = None) -> pd.DataFrame:
-    """Library entry point — called by optimisation_model.main() with the fresh deterministic
-    cost-round DataFrame, and by this module's own CLI with the same frame read back from the
-    "NPV Data" sheet of the deterministic workbook.
-
-    Passing the in-memory frame is what makes this safe to run in-pipeline: the fixed-sizing
-    re-solve pins n_pv to the saved design, so a saved run that predates a change to the roof-area
-    cap (or any other sizing bound) goes infeasible on every row. Sourcing the sizing from the run
-    that just completed removes that failure mode by construction — see the module docstring.
-    """
     print(f"Panel 1 / Panels 16-18 price ratio applied to capex_per_kwp: {PRICE_RATIO:.4f}")
 
     base = all_rows[all_rows["status"] == "Optimal"].reset_index(drop=True)
@@ -198,16 +155,10 @@ def run_pv_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: in
         return pd.DataFrame()
     print(f"{len(base)} of {len(all_rows)} designs Optimal -- solving Panel 1 dispatch for each")
 
-    logical = os.cpu_count() or 2
-    # Physical-core parallelism, matching the rest of the pipeline: independent large LPs contend
-    # for cache/memory bandwidth badly enough to false-fail clean cells if workers x threads is
-    # pushed to the logical-core count.
-    n_jobs = max(1, n_jobs or logical // 4)
-    threads_per_worker = max(1, logical // n_jobs)
+    # Same worker/thread sizing rule as the rest of the pipeline.
+    n_jobs, threads_per_worker = resolve_jobs(n_jobs, len(base))
 
-    # Read the default module area in the PARENT, before _pool_init swaps Panel 1 into TECH_COSTS in
-    # each worker — it is the denominator of the area match and must be the geometry the saved
-    # designs were sized with.
+    # Denominator of the area match.
     base_module_area_m2 = float(oe.TECH_COSTS["pv"]["module_area_m2"])
 
     tasks = [(r.district, r.activity, r.heating, r.n_pv, r.e_batt_kwh, r.o_batt_kw,
@@ -239,9 +190,7 @@ def run_pv_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: in
     out["opex_npv_GBP_delta"]             = out["panel1_opex_npv_GBP"] - out["base_opex_npv_GBP"]
     out["total_cost_npv_GBP_delta"]       = out["panel1_total_cost_npv_GBP"] - out["base_total_cost_npv_GBP"]
     out["lifetime_emissions_tco2e_delta"] = out["panel1_lifetime_emissions_tco2e"] - out["base_lifetime_emissions_tco2e"]
-    # NA (not False) when Panel 1's fixed-sizing dispatch is Infeasible -- distinct from "solved but
-    # costs more". Infeasible means the design can't run on Panel 1 without a resize (e.g. reduced
-    # daytime generation pushes required grid import over the district's DNO connection limit).
+    # NA (not False) when Panel 1's fixed-sizing dispatch is Infeasible
     is_optimal = out["panel1_status"] == "Optimal"
     out["cheap_panel_pays_off"] = pd.Series(pd.NA, index=out.index, dtype="boolean")
     out.loc[is_optimal, "cheap_panel_pays_off"] = out.loc[is_optimal, "total_cost_npv_GBP_delta"] < 0
@@ -260,13 +209,8 @@ def run_pv_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: in
                 f"{PRICE_RATIO:.4f} (Panel 1 / mean(Panels 16-18) GBP/Wp, same source+year)",
                 "First-stage sizing (e_batt, o_batt, q_heat_cap, e_th) fixed at the saved "
                 "deterministic-round solution; only stage-2 dispatch is re-solved with Panel 1's PV "
-                "params swapped in. Baseline (base_*) columns are the saved sweep values, not re-solved. "
-                "PV is AREA-matched rather than count-matched: n_pv is rescaled by "
-                "1.75/1.63 m^2 (capped at the Panel 1 roof limit) so both panels occupy the same roof "
-                "area. Count-matching would leave 6.9% of the roof empty under Panel 1 and charge "
-                "that shortfall to panel efficiency; every array here is area-limited, not "
-                "weight-limited, so area is the constraint that must be held fixed. "
-                "panel1_n_pv reports the module count actually solved.",
+                "params swapped in. PV is AREA-matched rather than count-matched: n_pv is rescaled by "
+                "1.75/1.63 m^2 (capped at the Panel 1 roof limit) so both panels occupy the same roof area.",
             ],
         })
         notes.to_excel(xw, sheet_name="Assumptions", index=False)
@@ -284,13 +228,14 @@ def run_pv_sensitivity(all_rows: pd.DataFrame, run_dir: str, *, time_limit_s: in
 def main():
     ap = argparse.ArgumentParser(description="Standalone re-run against an already-completed "
                                              "optimisation run. The pipeline calls "
-                                             "run_pv_sensitivity() directly instead.")
+                                             "run_pv_sensitivity() directly.")
     ap.add_argument("--limit", type=int, default=None,
                     help="Only solve the first N designs (for a quick test run).")
     ap.add_argument("--time-limit", type=int, default=600, dest="time_limit", metavar="S",
                     help="per-design solver time limit in seconds (default: 600)")
     ap.add_argument("--jobs", type=int, default=None, metavar="N",
-                    help="parallel worker processes (default: logical cores // 4)")
+                    help="parallel worker processes (default: a quarter of the logical cores; "
+                         "see optimisation_config.resolve_jobs)")
     args = ap.parse_args()
 
     run_dir = _latest_run_dir()

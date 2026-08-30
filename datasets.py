@@ -2,8 +2,7 @@
 Import-only.
 
 One get_*() per source, returning a clean object (pd.DataFrame / pd.ExcelFile) and hiding
-formatting behind a single import. All data/ paths are resolved here, so no other module
-hardcodes them. File-based sources only; no network/API calls.
+formatting behind a single import. File-based sources only.
 
 Sources:
   inputs_workbook()            data/inputs.xlsx                          -> pd.ExcelFile
@@ -14,6 +13,9 @@ Sources:
   get_osm_flat_by_footprint()  data/api_osm_storeys.xlsx :: Flat by Footprint-> DataFrame
   get_temperature_profile()    data/api_temperature_profiles.xlsx :: HourlyTemp -> np.ndarray(24)
   get_temperature_anomaly()    data/api_temperature_profiles.xlsx :: HourlyTemp -> np.ndarray(24)
+
+Also owns the footprint-size band definition (FOOTPRINT_BINS / FOOTPRINT_LABELS) shared by the
+producer of the OSM survey (api_osm_storeys.py) and its consumer (optimisation_engine.py).
 """
 
 import os
@@ -21,6 +23,7 @@ import numpy as np
 import openpyxl
 import pandas as pd
 from districts import SUNSHINE_FILE
+from seasons import HOURS_PER_DAY
 
 # 1 - SETUP
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -31,6 +34,10 @@ def _path(*parts):
 INPUTS_XLSX       = _path("inputs.xlsx")
 OSM_STOREYS_XLSX  = _path("api_osm_storeys.xlsx")
 TEMPERATURE_PROFILES_XLSX = _path("api_temperature_profiles.xlsx")
+
+# Footprint-size bands for the OSM roof survey. 
+FOOTPRINT_BINS   = [0, 250, 1000, 5000, float("inf")]
+FOOTPRINT_LABELS = ["<250", "250-1,000", "1,000-5,000", ">=5,000"]
 
 # Degree-days baseline window: average HDD data over the last N calendar years.
 HDD_BASELINE_YEARS = 3
@@ -46,7 +53,7 @@ def read_dated_csv(path, **read_csv_kwargs):
     return pd.read_csv(path, skiprows=skip, **read_csv_kwargs)
 
 def inputs_workbook():
-    """data/inputs.xlsx as a pd.ExcelFile (caller manages the context + per-sheet parsing)."""
+    """data/inputs.xlsx as a pd.ExcelFile."""
     return pd.ExcelFile(INPUTS_XLSX)
 
 
@@ -107,10 +114,8 @@ def get_osm_flat_by_footprint():
 
 
 # 6 - ERA5 TEMPERATURE (API) 
-# Getters return None when the workbook is absent so demand_profile_model falls back to its
-# idealised sinusoid instead of failing.
-HOURS_PER_DAY = 24
-
+# Getters return None when the workbook is absent; 
+# demand_profile_model falls back to idealised sinusoid instead of failing.
 _TEMPERATURE_CACHE = None
 
 def _load_temperature_profiles(path=TEMPERATURE_PROFILES_XLSX):
@@ -166,14 +171,6 @@ def get_temperature_anomaly(district, season, path=TEMPERATURE_PROFILES_XLSX):
     if prof is None:
         return None
     return prof - prof.mean()
-
-def has_temperature_profiles(path=TEMPERATURE_PROFILES_XLSX):
-    """True if the temperature-profile workbook exists and parses (for callers to decide fallback)."""
-    try:
-        return len(_load_temperature_profiles(path)) > 0
-    except (FileNotFoundError, ValueError):
-        return False
-
 
 # 7 - PROJECTION OUTPUT
 ELEC_PROJECTION_CSV    = _path("electricity_projection_output.csv")

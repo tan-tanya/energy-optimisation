@@ -1,18 +1,16 @@
 """
-Import-only. 
-Builds and solves one cell's PV/battery/heat-pump/thermal-store problem, and sweeps every cell for a run. 
-optimisation_model.py is the thin CLI on top, re-exports the names below so existing consumers that 
-`import optimisation_model as om` keep working unchanged.
+Import-only. Builds and solves one cell's PV/battery/heat-pump/thermal-store problem, and sweeps every cell. 
 
 Inputs
 1. demand_profile_model; reused module-level state and helpers
-    - DISTRICT_STATIONS, MONTHS_ORDER, MONTH_SEASON, WE_LOAD_FACTOR, HDD_BASE, DIURNAL_AMPLITUDE
+    - DISTRICT_STATIONS, MONTHS_ORDER, MONTH_SEASON, MONTH_DAYS, MONTH_START_DOY, HDD_BASE
+    - WE_LOAD_FACTOR + wd_we_factors()                  (weekday / weekend load split)
     - half_hourly_kw_per_sqm()                          (half-hourly electricity or gas demand per m², kW/m²)
     - solar_elevation_profile()                         (peak-shape hourly solar elevation per parent season)
     - hourly_temp_profile()                             (diurnal temperature swing around mean T)
     - daily_hdd_by_district, monthly_dd_by_district     (per-district daily/monthly degree-day stats)
     - bees_floor_areas                                  (BEES median premises floor area per activity, m²)
-2. data/sunlighthours/*.txt;                            (Met Office HadUK-Grid monthly sunshine hours per district)
+2. model_params / optimisation_config;                  technology costs, horizon and solver settings
 
 Model layers:
     (a) PV generation     irradiance shape × monthly daily-GHI × temperature derate × SOH (module + inverter)
@@ -23,15 +21,17 @@ Model layers:
     (e) COP               ASHP: varies with intra-day temperature; GSHP: flat for vertical, month-averaged daily ground-temp for horizontal
     (f) Boiler            gas_im = heat_prod / η_boiler
     (g) Thermal storage   heat_prod + heat_dis == heat_dem + heat_chg
-    (h) Grid              flat-rate import/export with annual price escalation, capped by DNO connection
-    (i) Economics         capex (incl. BoS + install fixed costs), opex (NPV), maintenance + insurance (escalating, NPV),
-                          year-10 replacements (PV inverter + battery); 15-yr horizon at WACC = 5%
+    (h) Grid              half-hourly time-of-use import price (wholesale shape + DUoS band + CCL + residual,
+                          see pricing.py; flat DESNZ band price when USE_WHOLESALE_DUOS_BUILDUP is off),
+                          flat export price, both escalated annually and capped by the DNO connection
+    (i) Economics         capex,  opex, maintenance + insurance, plus any replacement falling inside the 
+                          horizon. Discounted at 3.5% (real, HM Treasury Green Book).
     (j) Dispatch          24 representative days/year (12 months × WD/WE), weighted by 2025 WD/WE day counts
 
 Pipeline:
-    1. build_milp()              assemble the LP/MILP for one (district, activity, heating)
+    1. build_lp()                assemble the LP for one (district, activity, heating)
     2. solve_scenario()          solve and extract sizing + cost + energy metrics
-    3. rank_all_combinations() / _run_merged_sweep()   sweep every (district, activity, heating)
+    3. _run_merged_sweep()       sweep every (district, activity, heating) through one worker pool
     4. write_results_workbook()  write the ranking sheets
 """
 
@@ -52,34 +52,29 @@ from model_params import (
     DISTRICT_MONTHLY_GHI, select_elec_band, select_gas_band, select_grid_limit,
     GAS_EMISSION_FACTOR, elec_emission_factor, carbon_value,
     HORIZONTAL_COLLECTOR_M2_PER_KWTH, SITE_PLOT_RATIO, PARKING_GROSS_M2_PER_SPACE,
-    EV_PARKING_DENSITY,
+    EV_PARKING_DENSITY, PRIMARY_ENERGY_FACTORS,
 )
+from seasons import HH_PER_DAY
 from optimisation_config import (
-    HORIZON_YEARS, T_RES_H, HH_PER_DAY, BATT_MAX_KWH, BATT_MAX_KW,
-    DEFAULT_TIME_LIMIT_S, MIP_GAP_REL, LP_METHOD, PARALLEL_JOBS, SOLVER_THREADS,
-    USE_WHOLESALE_DUOS_BUILDUP, NEW_BUILD, S_KEYS, N_DAYS_OF,
+    HORIZON_YEARS, T_RES_H, BATT_MAX_KWH, BATT_MAX_KW,
+    DEFAULT_TIME_LIMIT_S, PARALLEL_JOBS, USE_WHOLESALE_DUOS_BUILDUP, NEW_BUILD,
+    S_KEYS, N_DAYS_OF, resolve_jobs,
 )
 from growth import cop_delta_factors, elec_growth_factors, heat_growth_factors
 from pricing import import_price_slots_central
 
 
-# TSSP Stage 1: sizing/selection — n_pv, e_batt, o_batt, q_heat_cap, e_th
-# TSSP Stage 2: dispatch — e_im, e_ex, e_chg, e_disc, q_heat_prod, q_heat_dis, q_heat_chg
-# The only uncertain input in this iteration is the electricity import price; export and gas prices stay central
-# Emissions are price-independent, so the emissions objective is solved deterministically on a single central scenario
+# Stage 1: sizing/selection — n_pv, e_batt, o_batt, q_heat_cap, e_th
+# Stage 2: dispatch — e_im, e_ex, e_chg, e_disc, q_heat_prod, q_heat_dis, q_heat_chg
+# The only uncertain input is the electricity import price.
 _PRICE_SCENARIOS = None   
 
 def price_scenarios() -> list:
-    # Reduced, weighted electricity import-price scenarios for the cost objective
+    # Reduced, weighted electricity import-price scenarios for the cost objective.
     global _PRICE_SCENARIOS
     if _PRICE_SCENARIOS is None:
         _PRICE_SCENARIOS = unc.generate_price_scenarios(horizon=HORIZON_YEARS)
     return _PRICE_SCENARIOS
-
-def set_price_scenarios(scenarios: list) -> None:
-    # Override the cached reduced price-scenario set. 
-    global _PRICE_SCENARIOS
-    _PRICE_SCENARIOS = scenarios
 
 def central_scenario() -> "unc.Scenario":
     # Single scenario reproducing the deterministic central case
@@ -94,6 +89,18 @@ def _scenarios_for(objective: str, scenarios: list = None) -> list:
     return price_scenarios() if objective == "cost" else [central_scenario()]
 
 
+# Two-round cost optimisation:
+#   deterministic - single central price scenario
+#   stochastic    - reduced weighted price-scenario set
+COST_ROUNDS = ("deterministic", "stochastic")
+
+def scenarios_for_round(name: str) -> list:
+    # The price-scenario set a named cost round is solved on.
+    if name not in COST_ROUNDS:
+        raise ValueError(f"unknown cost round {name!r}; expected one of {COST_ROUNDS}")
+    return [central_scenario()] if name == "deterministic" else price_scenarios()
+
+
 def _ensure_dm_initialized():
     # dm.initialize() populates bees_floor_areas, daily_hdd_by_district, monthly_dd_by_district, etc.
     if dm.bees_floor_areas is None:
@@ -105,16 +112,14 @@ def _ensure_dm_initialized():
 # OSM storey survey output
 OSM_STOREYS_XLSX = datasets.OSM_STOREYS_XLSX   # data/api_osm_storeys.xlsx (single path source: datasets)
 
-# Footprint-size bands — must match FOOTPRINT_BINS / FOOTPRINT_LABELS in api_osm_storeys.py.
-FOOTPRINT_BINS   = [0, 250, 1000, 5000, float("inf")]
-FOOTPRINT_LABELS = ["<250", "250-1,000", "1,000-5,000", ">=5,000"]
+# Footprint-size bands, shared with the survey that produced them (single source: datasets.py).
+FOOTPRINT_BINS   = datasets.FOOTPRINT_BINS
+FOOTPRINT_LABELS = datasets.FOOTPRINT_LABELS
 
 _osm_median_storeys   = None  # set up {activity: median storeys}; lazily loaded from OSM_STOREYS_XLSX
 _osm_flat_by_footprint = None # set up {(activity, band): flat fraction}; lazily loaded from OSM_STOREYS_XLSX
 
-# Horizon / solver constants, the wholesale+DUoS build-up flags.
-
-# 2 - PV generation model (eq. 1.21–1.24, 1.47, 1.49)
+# 2 - PV generation model
 
 def daily_ghi_kwh_per_m2(district: str, month: str) -> float:
     # Per-district daily GHI (kWh/m²/day): PVGIS-SARAH3 2005–2023 monthly average at the district's reference station.
@@ -170,25 +175,20 @@ def roof_area_m2_for_activity(activity: str) -> float:
     return roof_to_floor_ratio(activity) * dm.bees_floor_areas[activity]
 
 # Horizontal ground-loop land availability
-# A trenched (slinky) collector needs open SOFT ground in proportion to its thermal capacity; a
-# vertical borefield does not. Chain: plot ratio gives the site, subtract the building footprint,
-# subtract committed hardstanding (parking), and what remains is available for the collector.
+# A trenched (slinky) collector needs open soft ground in proportion to its thermal capacity.
 def site_area_m2(activity: str) -> float:
-    # Plot ratio is gross FLOORSPACE / site area, so it divides floor area directly (not footprint).
+    # Plot ratio is gross floorspace / site area, so it divides floor area directly (not footprint).
     return dm.bees_floor_areas[activity] / SITE_PLOT_RATIO
 
 
 def parking_area_m2(activity: str) -> float:
-    # Committed hardstanding = spaces (per m2 GFA) x gross land per space. Reuses the per-activity
-    # EV_PARKING_DENSITY already on the workbook so there is one parking assumption, not two.
+    # Spaces (per m2 GFA) x gross land per space. Reuses the per-activity EV_PARKING_DENSITY.
     return (dm.bees_floor_areas[activity] * EV_PARKING_DENSITY[activity]
             * PARKING_GROSS_M2_PER_SPACE)
 
 
 def soft_ground_m2(activity: str) -> float:
-    # Open land left after the building and its parking. Clamped at 0: for the smallest buildings the
-    # maximum parking standard can exceed the plot-ratio-implied site, i.e. the two sourced maxima are
-    # mutually inconsistent — that means parking-dominated, so no collector land, not negative land.
+    # Open land left after the building and its parking, clamped at 0 m2.
     return max(0.0, site_area_m2(activity)
                - roof_area_m2_for_activity(activity) - parking_area_m2(activity))
 
@@ -199,8 +199,7 @@ def horizontal_loop_max_kwth(activity: str) -> float:
 
 
 def land_limit_kwth(activity: str, heating: str) -> float:
-    # Land-imposed ceiling on q_heat_cap. Only GSHP (horizontal) is constrained; everything else
-    # (vertical borefield, ASHP, gas boiler) is unconstrained by surface area.
+    # Land-imposed ceiling on q_heat_cap - only GSHP (horizontal) is constrained.
     if heating != "GSHP (horizontal)":
         return float("inf")
     return horizontal_loop_max_kwth(activity)
@@ -239,21 +238,28 @@ def flat_share_for_activity(activity: str) -> float:
                 return table[(activity, FOOTPRINT_LABELS[j])]
     raise KeyError(f"No flat-share data for {activity!r} in any footprint band")
 
-def roof_usable_frac_for_activity(activity: str) -> float:
-    # Blended usable-area fraction of the footprint, combining the flat and pitched portions.
+def roof_type_usable_fracs(activity: str) -> tuple:
+    # (flat, pitched) usable-area fractions of the footprint for one activity class.
     # Both roof types carry the SAME per-activity usable-area fraction, differing only in the roof-type-specific derate:
-    #   flat    → × inter-row spacing (self-shading clearance between rows of a tilted rack);
-    #   pitched → × sec(pitch) slope-area gain × PITCHED_USABLE_SLOPE_FRAC. 
-    #               Pitched modules mount flush to the slope, so there is no inter-row derate (BRE NSC 2016).
-    flat          = flat_share_for_activity(activity)
-    props         = ROOF_PROPERTIES[activity]
-    flat_frac     = props["pv_usable_frac"] * props["pv_inter_row_frac"]
-    pitch_factor  = ((1.0 / np.cos(np.radians(ROOF_PITCH_DEG)))
-                     * PITCHED_USABLE_SLOPE_FRAC * props["pv_usable_frac"])
+    #   flat:    × inter-row spacing (self-shading clearance between rows of a tilted rack);
+    #   pitched: × sec(pitch) slope-area gain × PITCHED_USABLE_SLOPE_FRAC. Pitched modules mount
+    #            flush, so they take no inter-row derate.
+    props        = ROOF_PROPERTIES[activity]
+    flat_frac    = props["pv_usable_frac"] * props["pv_inter_row_frac"]
+    pitch_factor = ((1.0 / np.cos(np.radians(ROOF_PITCH_DEG)))
+                    * PITCHED_USABLE_SLOPE_FRAC * props["pv_usable_frac"])
+    return flat_frac, pitch_factor
+
+
+def roof_usable_frac_for_activity(activity: str) -> float:
+    # Blended usable-area fraction of the footprint, weighting the flat and pitched factors by the
+    # activity's surveyed flat-roof share.
+    flat = flat_share_for_activity(activity)
+    flat_frac, pitch_factor = roof_type_usable_fracs(activity)
     return flat * flat_frac + (1.0 - flat) * pitch_factor
 
 def n_pv_max_for_activity(activity: str) -> int:
-    # Maximum installable modules — binding of area (flat+pitched split) and roof live-load weight.
+    # Maximum installable modules — binding of area and roof loading limit.
     roof_area   = roof_area_m2_for_activity(activity)
     pv          = TECH_COSTS["pv"]
     usable_frac = roof_usable_frac_for_activity(activity)
@@ -262,17 +268,15 @@ def n_pv_max_for_activity(activity: str) -> int:
     return int(np.floor(min(by_area, by_weight)))
 
 
-# 3 - Demand wrapper (electricity-only, lighting + plug + HVAC + EV)
+# 3 - Demand (electricity-only, lighting + plug + HVAC + EV)
 def _wd_we_demand(activity: str, district: str, kw_per_m2) -> dict:
-    # Shared scaffold for the non-heat and heat demand builders: month loop + WD/WE split.
+    # Month loop + WD/WE split.
     # kw_per_m2(month, parent, monthly_dd_m, dd_daily) -> 48-element kW/m² array for that month.
-    # WD/WE split: base profile × wd_fac for WD and × wd_fac × f for WE, with wd_fac = 7/(5+2f) and f = WE_LOAD_FACTOR[activity]
+    # WD/WE split factors come from dm.wd_we_factors() so the demand model and the report agree.
     dd_daily   = dm.daily_hdd_by_district[district]
     monthly_dd = dm.monthly_dd_by_district[district]
     floor_area = dm.bees_floor_areas[activity]
-    f          = dm.WE_LOAD_FACTOR[activity]
-    wd_fac     = 7.0 / (5.0 + 2.0 * f)
-    we_fac     = wd_fac * f
+    wd_fac, we_fac = dm.wd_we_factors(activity)
 
     out = {}
     for m in dm.MONTHS_ORDER:
@@ -306,19 +310,18 @@ def building_heat_demand_kwh(activity: str, district: str) -> dict:
 def cop_profile(heating: str, district: str, month: str, delta_t: float = 0.0) -> np.ndarray:
     # ASHP: varies with outdoor air temperature over the day;
     # GSHP: flat for vertical loops; for horizontal loops the COP follows the 1.5 m ground temperature 
-    # delta_t (°C) shifts the driving temperature for future-climate warming
     system = dm.HEATING_SYSTEMS[heating]
     if not system["is_heat_pump"]:
         return None
     parent      = dm.MONTH_SEASON[month]
     monthly_hdd = dm.monthly_dd_by_district[district][month]["hdd_per_day"]
     loop_type   = system["loop_type"]
-    if loop_type is None:                                   # ASHP — air source
+    if loop_type is None:                                   # ASHP
         t_ext_mean = (dm.HDD_BASE - monthly_hdd) + delta_t
         t_hourly = dm.hourly_temp_profile(t_ext_mean, parent, district=district)
         cop24    = np.array([dm.cop_ashp(t) for t in t_hourly])
         return np.repeat(cop24, 2)
-    stats       = dm.district_climate_stats[district]       # GSHP — ground source
+    stats       = dm.district_climate_stats[district]       # GSHP 
     annual_mean = stats["annual_mean_T_C"] + delta_t
     first_doy   = dm.MONTH_START_DOY[month]
     days        = range(first_doy, first_doy + dm.MONTH_DAYS[month])
@@ -347,15 +350,11 @@ def soh_batt(year: int) -> float:
 def discount_factor(year: int) -> float:
     return 1.0 / (1.0 + TECH_COSTS["discount_rate"]) ** year
 
-def import_price(year: int, base: float) -> float:
-    # base = year-0 import price (GBP/kWh) for the building's DESNZ size band (see select_elec_band)
-    return base * (1.0 + TECH_COSTS["elec_price_growth"]) ** year
-
 def export_price(year: int) -> float:
     return TECH_COSTS["elec_export_price"] * (1.0 + TECH_COSTS["elec_price_growth"]) ** year
 
 def gas_price(year: int, base: float) -> float:
-    # base = year-0 gas import price (GBP/kWh) for the building's DESNZ gas size band (see select_gas_band)
+    # base = year-0 gas import price (GBP/kWh) for the building's DESNZ gas size band 
     return base * (1.0 + TECH_COSTS["gas_price_growth"]) ** year
 
 
@@ -368,8 +367,6 @@ def _prepare_data(district: str, activity: str, heating: str, horizon_years: int
     Y = range(horizon_years)
     demand_kwh = building_demand_kwh(activity, district)
     heat_kwh   = building_heat_demand_kwh(activity, district)
-    # Non-heat peak captured before demand_multiplier scaling — see the import-ceiling floor below.
-    unscaled_peak_kwh = max(float(arr.max()) for arr in demand_kwh.values())
     if demand_multiplier != 1.0:
         demand_kwh = {k: v * demand_multiplier for k, v in demand_kwh.items()}
         heat_kwh   = {k: v * demand_multiplier for k, v in heat_kwh.items()}
@@ -380,12 +377,8 @@ def _prepare_data(district: str, activity: str, heating: str, horizon_years: int
 
     # Grid connection ceilings (kW) per district, from Scalars sheet.
     glim            = select_grid_limit(district)
-    base_import_kw  = glim["import_kw"] if import_limit_override_kw is None else import_limit_override_kw
-    # Floor the import ceiling at the final-horizon-year electricity so the site can serve its non-flexible load even after demand growth.
-    # The floor is built from the UNSCALED non-heat peak: demand_multiplier must not raise the ceiling. 
-    baseline_peak_kw = unscaled_peak_kwh / T_RES_H * max(elec_growth)
-    import_limit_kw  = max(base_import_kw, baseline_peak_kw)
-    export_limit_kw  = max(glim["export_kw"], 0.0)
+    import_limit_kw = glim["import_kw"] if import_limit_override_kw is None else import_limit_override_kw
+    export_limit_kw = max(glim["export_kw"], 0.0)
 
     is_hp = dm.HEATING_SYSTEMS[heating]["is_heat_pump"]
     # COP improves over the horizon as the climate warms.
@@ -422,7 +415,6 @@ def _prepare_data(district: str, activity: str, heating: str, horizon_years: int
     df_y       = [discount_factor(y) for y in Y]
     if USE_WHOLESALE_DUOS_BUILDUP:
         # Slot-dependent import price: year-0 central build-up per (day_type, slot), escalated by each scenario's path and discounted. 
-        # Keyed (y, m, d, t) so the intra-day ToU + regional shape reaches the objective's per-slot import term.
         slot_c = import_price_slots_central(district, elec_band["name"])
         im_d = {w: {(y, m, d, t): slot_c[(m, d, t)] * float(scen.path[y]) * df_y[y]
                     for y in Y for (m, d) in S_KEYS for t in range(HH_PER_DAY)}
@@ -438,8 +430,6 @@ def _prepare_data(district: str, activity: str, heating: str, horizon_years: int
     gas_d      = [gas_price(y, gas_base) * df_y[y] for y in Y]
     infl_d     = [(1.0 + TECH_COSTS["general_inflation"]) ** y * df_y[y] for y in Y]
     soh_batt_y = [soh_batt(y) for y in Y]
-    # Carbon: grid emission-factor trajectory (kgCO2e/kWh) per horizon year, gas factor (constant),
-    # and the appraisal carbon value (GBP/tCO2e) discounted for the monetised-carbon reporting figure.
     ef_elec_y  = [elec_emission_factor(y) for y in Y]
     cval_d     = [carbon_value(y) * df_y[y] for y in Y]
 
@@ -457,11 +447,6 @@ def _prepare_data(district: str, activity: str, heating: str, horizon_years: int
         "heat_growth": heat_growth,
         "cop":         cop,
         "peak_kwth":   peak,
-        # Heat-plant capacity ceiling: 2x peak demand (headroom to charge the store), tightened for
-        # GSHP (horizontal) by the collector land actually available. Expressed as a capacity BOUND
-        # rather than a pre-solve yes/no so a land-limited site can still adopt a SMALLER horizontal
-        # loop leaning harder on the thermal store; if even that cannot serve the load the LP returns
-        # Infeasible, which is the physically meaningful answer.
         "q_heat_max":  min(peak * 2.0, land_limit_kwth(activity, heating)),
         "land_limit_kwth": land_limit_kwth(activity, heating),
         "th_max_kwh":  peak * 24.0,    # buffer up to ~a day of peak heat
@@ -487,7 +472,7 @@ def _prepare_data(district: str, activity: str, heating: str, horizon_years: int
     }
 
 
-def _declare_variables(data: dict, use_binary_mutex: bool) -> dict:
+def _declare_variables(data: dict) -> dict:
     # Stage-1 sizing variables (shared across scenarios) + stage-2 dispatch variables (per scenario w).
     Y, S, T, W = data["Y"], data["S"], data["T"], data["W"]
 
@@ -496,10 +481,6 @@ def _declare_variables(data: dict, use_binary_mutex: bool) -> dict:
         "n_pv":       pulp.LpVariable("n_pv",       lowBound=0, upBound=data["n_pv_max"],  cat="Continuous"),
         "e_batt":     pulp.LpVariable("e_batt",     lowBound=0, upBound=BATT_MAX_KWH,      cat="Continuous"),
         "o_batt":     pulp.LpVariable("o_batt",     lowBound=0, upBound=BATT_MAX_KW,       cat="Continuous"),
-        # PV / thermal-store install gates (z_pv, z_th) are omitted: with no fixed install cost they carry
-        # no objective pressure, so they optimise to 1 and their big-M constraints reduce to the n_pv_max /
-        # th_max_kwh upper bounds already declared here. Reintroduce as cat="Binary" if a fixed cost is added.
-        # Heat sizing: heating-plant thermal capacity (mandatory) + thermal store (optional)
         "q_heat_cap": pulp.LpVariable("q_heat_cap", lowBound=0, upBound=data["q_heat_max"], cat="Continuous"),
         "e_th":       pulp.LpVariable("e_th",       lowBound=0, upBound=data["th_max_kwh"], cat="Continuous"),
     }
@@ -526,16 +507,10 @@ def _declare_variables(data: dict, use_binary_mutex: bool) -> dict:
     else:
         V["gas_im"]    = vd("gas_im",    lowBound=0)
 
-    if use_binary_mutex:
-        V["beta_chg"]  = vd("b_chg",  cat="Binary")
-        V["beta_disc"] = vd("b_disc", cat="Binary")
-        V["beta_im"]   = vd("b_im",   cat="Binary")
-        V["beta_ex"]   = vd("b_ex",   cat="Binary")
-
     return V
 
 
-def _add_constraints(prob, V: dict, data: dict, use_binary_mutex: bool) -> None:
+def _add_constraints(prob, V: dict, data: dict) -> None:
     bat       = TECH_COSTS["battery"]
     eta_chg   = bat["chg_eff"]
     eta_disc  = bat["disc_eff"]
@@ -567,14 +542,10 @@ def _add_constraints(prob, V: dict, data: dict, use_binary_mutex: bool) -> None:
     elec_heat = V.get("elec_heat")    # heat-pump techs only
     gas_im    = V.get("gas_im")       # gas boiler only
 
-    # PV / thermal-store sizing caps are enforced by the variable upper bounds set in _declare_variables.
 
     # PCS sizing from C-rate
     prob += o_batt <= bat["c_rate_chg"]  * e_batt, "pcs_chg_c_rate"
     prob += o_batt <= bat["c_rate_disc"] * e_batt, "pcs_disc_c_rate"
-
-    M_disp = (max(BATT_MAX_KW, data["import_limit_kw"], data["export_limit_kw"]) * T_RES_H
-              if use_binary_mutex else None)
 
     for y in data["Y"]:
         soc_lo_y = SOC_min * e_batt * soh_batt_y[y]
@@ -615,15 +586,7 @@ def _add_constraints(prob, V: dict, data: dict, use_binary_mutex: bool) -> None:
                 # Grid import/export limits (split: demand-headroom vs generation-headroom)
                 prob += e_im[(w,y,m,d,t)] <= grid_im_max, f"im_lim_{tag}_{t}"
                 prob += e_ex[(w,y,m,d,t)] <= grid_ex_max, f"ex_lim_{tag}_{t}"
-                # Export must be GENERATED, not resold. Without this the balance alone permits
-                # importing and exporting in the same slot: under the emissions objective the two
-                # carry identical coefficients and cancel exactly, so the round-trip is free and the
-                # LP is degenerate along it (simplex then returns an arbitrary vertex, pinned at the
-                # grid limits); and whenever the export price exceeds the import price it becomes
-                # strictly profitable, which is grid-to-grid arbitrage rather than a PV business
-                # case. Capping export at own generation + storage discharge removes both, matches
-                # SEG (which pays for exported generation only), and keeps the model an LP — the
-                # binary import/export mutex would do the same at MILP cost.
+                # Export restricted to electricity that was generated, not imported. 
                 prob += (e_ex[(w,y,m,d,t)] <= n_pv * pv_t + e_disc[(w,y,m,d,t)]), f"ex_gen_{tag}_{t}"
 
                 # Heat side
@@ -656,17 +619,7 @@ def _add_constraints(prob, V: dict, data: dict, use_binary_mutex: bool) -> None:
                     prob += (gas_im[(w,y,m,d,t)]
                              == heat_prod[(w,y,m,d,t)] / dm.ETA_BOILER), f"boiler_gas_{tag}_{t}"
 
-                # Optional strict binaries (eq. 1.31, 1.54)
-                if use_binary_mutex:
-                    prob += e_chg[(w,y,m,d,t)]  <= M_disp * V["beta_chg"][(w,y,m,d,t)]
-                    prob += e_disc[(w,y,m,d,t)] <= M_disp * V["beta_disc"][(w,y,m,d,t)]
-                    prob += V["beta_chg"][(w,y,m,d,t)] + V["beta_disc"][(w,y,m,d,t)] <= 1
-                    prob += e_im[(w,y,m,d,t)] <= M_disp * V["beta_im"][(w,y,m,d,t)]
-                    prob += e_ex[(w,y,m,d,t)] <= M_disp * V["beta_ex"][(w,y,m,d,t)]
-                    prob += V["beta_im"][(w,y,m,d,t)] + V["beta_ex"][(w,y,m,d,t)] <= 1
-
             # Daily SOC closure (per scenario): end-of-day level returns to the same floor it started at. 
-            # Loss-weighted via e_lvl (not raw chg==disc) — since round-trip efficiency < 100%.
             prob += e_lvl[(w, y, m, d, HH_PER_DAY - 1)] == soc_lo_y, f"soc_closure_{tag}"
 
 
@@ -697,8 +650,6 @@ def _build_objective(prob, V: dict, data: dict,
         c_heat_capex         = c_heat_equip
         c_heat_replace_basis = c_heat_equip
     elif is_hp:                                            # retrofit, heat pump
-        # Decommissioning the old gas boiler = a one-off FIXED gas-service disconnection charge 
-        # (per site, independent of boiler size, inclusive of strip-out/disposal).
         decommission_fixed   = HEAT_COSTS["Gas Boiler"].get("decommission_fixed", 0.0)
         c_heat_capex         = c_heat_equip + decommission_fixed
         c_heat_replace_basis = c_heat_equip               # the HP unit is replaced; decommissioning is one-off
@@ -711,12 +662,10 @@ def _build_objective(prob, V: dict, data: dict,
     W, weights = data["W"], data["weights"]
     ef_elec_y, ef_gas, cval_d = data["ef_elec_y"], data["ef_gas"], data["cval_d"]
 
-    # STAGE 2 (recourse). Electricity opex uses that scenario's discounted import-price path; export and gas are deterministic. 
-    # Emissions/monetised-carbon are price-independent but use each scenario's own dispatch, so they are kept per w too.
+    # STAGE 2 (recourse)
     c_opex_by_w, c_gas_by_w, emis_by_w, carbon_npv_by_w = {}, {}, {}, {}
     for w in W:
-        # Import price coefficient is per-(year) flat by default, or per-(year, month, day, slot) when
-        # the wholesale+DUoS build-up is active (intra-day ToU + regional shape). Export & gas unchanged.
+        # Import price coefficient is per-(year, month, day, slot) when wholesale+DUoS build-up is active.
         _slot_im = data["im_slot_dependent"]
         c_opex_by_w[w] = pulp.lpSum(
             (V["e_im"][(w,y,m,d,t)] * (data["im_d"][w][(y,m,d,t)] if _slot_im else data["im_d"][w][y])
@@ -747,7 +696,6 @@ def _build_objective(prob, V: dict, data: dict,
         )
 
     # STAGE 1 (deterministic) — capex, maintenance + insurance, and one-off replacements depend only on the shared sizing.
-    # Annual maintenance + insurance, escalated by general inflation, discounted.
     c_maint_npv = pulp.lpSum(
         (n_pv * pv_kwp_per_module / 1000.0 * (pv_c["maint_per_mw_per_yr"]
                                               + pv_c["insurance_per_mw_per_yr"])
@@ -799,38 +747,26 @@ def _build_objective(prob, V: dict, data: dict,
     V["c_replace_npv"] = c_replace_npv
 
 
-def effective_import_limit_kw(district: str, activity: str, *,
-                              horizon_years: int = HORIZON_YEARS,
-                              import_limit_override_kw: float = None) -> float:
-    # The grid-import ceiling the model actually applies to this cell: the district's 
-    # DNO ceiling, floored at the building's own final-horizon-year non-heat peak.
+def build_lp(district: str, activity: str, heating: str, *,
+             horizon_years: int = HORIZON_YEARS,
+             objective: str = "cost",
+             emissions_cap: float = None,
+             scenarios: list = None,
+             demand_multiplier: float = 1.0,
+             import_limit_override_kw: float = None):
+    # Pure LP: every variable is continuous. Simultaneous import/export and simultaneous
+    # charge/discharge are ruled out by the price/efficiency structure, not by binaries.
     _ensure_dm_initialized()
-    glim     = select_grid_limit(district)
-    base_kw  = glim["import_kw"] if import_limit_override_kw is None else import_limit_override_kw
-    peak_kwh = max(float(arr.max()) for arr in building_demand_kwh(activity, district).values())
-    floor_kw = peak_kwh / T_RES_H * max(elec_growth_factors(horizon_years))
-    return max(base_kw, floor_kw)
-
-
-def build_milp(district: str, activity: str, heating: str, *,
-               horizon_years: int = HORIZON_YEARS,
-               use_binary_mutex: bool = False, # Simultaneous import/export is blocked by the ex_gen_* export-at-own-generation cap in _add_constraints, so the binary mutex is not required and the model stays an LP
-               objective: str = "cost",
-               emissions_cap: float = None,
-               scenarios: list = None,
-               demand_multiplier: float = 1.0,
-               import_limit_override_kw: float = None):
     scenarios = _scenarios_for(objective, scenarios)
     prob = pulp.LpProblem(f"opt_{activity}_{district}_{heating}".replace(" ", "_").replace(":", ""),
                           pulp.LpMinimize)
     data = _prepare_data(district, activity, heating, horizon_years, scenarios,
                          demand_multiplier=demand_multiplier,
                          import_limit_override_kw=import_limit_override_kw)
-    V    = _declare_variables(data, use_binary_mutex)
-    _add_constraints(prob, V, data, use_binary_mutex)
+    V    = _declare_variables(data)
+    _add_constraints(prob, V, data)
     _build_objective(prob, V, data, objective=objective, emissions_cap=emissions_cap)
-    # Pass demand/PV/heat arrays + scenario metadata through V so the extractor can compute
-    # annual totals + BAU. All of these already live in `data` under the same key.
+    # Pass demand/PV/heat arrays + scenario metadata through V so the extractor can compute annual totals + BAU.
     V.update({k: data[k] for k in _V_FROM_DATA})
     V["district"] = district
     return prob, V
@@ -847,13 +783,10 @@ _V_FROM_DATA = (
 
 # 6 - SOLVER & RESULTS
 def _make_solver(solver_msg: bool, time_limit_s: int, threads: int = None):
-    base  = dict(msg=solver_msg, timeLimit=time_limit_s, gapRel=MIP_GAP_REL)
-    tuned = dict(base)
-    if threads is not None:
-        tuned["threads"] = threads
-    if LP_METHOD:
-        tuned["solver"] = LP_METHOD            # HiGHS option name for the LP method
-    for kwargs in (tuned, base):               
+    # HiGHS if available, CBC otherwise. 
+    base  = dict(msg=solver_msg, timeLimit=time_limit_s)
+    tuned = dict(base, threads=threads) if threads is not None else dict(base)
+    for kwargs in (tuned, base):
         try:
             s = pulp.HiGHS(**kwargs)
             if s.available():
@@ -864,8 +797,7 @@ def _make_solver(solver_msg: bool, time_limit_s: int, threads: int = None):
 
 
 def compute_payback(incr_capex: float, bau_annual: list, scen_annual: list, horizon_years: int) -> float:
-    # Greenfield payback on expected cash flows: cumulative (BAU − scenario annual cost) recovered
-    # against upfront incremental capex (scenario − BAU gas-boiler capex). 
+    # Payback period: cumulative (BAU − scenario annual cost) recovered against upfront incremental capex (scenario − BAU gas-boiler capex). 
     # Both annual streams are probability-weighted over the scenario set and undiscounted.
     if incr_capex <= 0:
         return 0.0    # already cheaper than BAU at year 0, so payback is immediate
@@ -883,8 +815,6 @@ def _bau_base(demand_kwh: dict, heat_kwh: dict, peak_kwth: float, horizon_years:
               elec_growth: list, heat_growth: dict, district: str = None,
               slot_prices: bool = False) -> dict:
     # Scenario-invariant BAU baseline: gas boiler sized to peak heat, all electricity from the grid, all heat from gas. 
-    # Capex, emissions, non-import annual cost (gas + maintenance + replacement), annual import kWh are all price-independent, 
-    # so this is computed once per cell and the cheap per-scenario import-price overlay is applied by _bau_assemble.
     gb   = HEAT_COSTS["Gas Boiler"]
     infl = TECH_COSTS["general_inflation"]   # insurance is now PV-only, so BAU has none
     dem_annual  = sum(demand_kwh[(m, d)].sum() * N_DAYS_OF[(m, d)] for (m, d) in S_KEYS)   # non-heat elec, year 0
@@ -893,17 +823,14 @@ def _bau_base(demand_kwh: dict, heat_kwh: dict, peak_kwth: float, horizon_years:
     for (m, d) in S_KEYS:
         heat_by_month[m] = heat_by_month.get(m, 0.0) + heat_kwh[(m, d)].sum() * N_DAYS_OF[(m, d)]
     gas_annual  = sum(heat_by_month.values()) / dm.ETA_BOILER                              # gas burned, year 0
-    # Band on the BAU's OWN consumption — non-heat electricity only, since the counterfactual burns
-    # gas for heat. Deliberately NOT the optimised design's band: a heat pump lifts site electricity
-    # into a larger (cheaper) DESNZ band, and charging the gas-boiler counterfactual that cheaper
-    # band credits the intervention's volume discount to the baseline it is measured against.
+    # Band on the BAU's own consumption — non-heat electricity only.
     bau_elec_band = select_elec_band(dem_annual / 1000.0)
     bau_base     = bau_elec_band["price"]
     bau_gas_base = select_gas_band(gas_annual / 1000.0)["price"]   # BAU is always a gas boiler
     # Per-scenario import price: central year-0 reference (active multiplier divided out) × scenario path.
     base_central = bau_base / TECH_COSTS.get("elec_import_multiplier", 1.0)
-    # When the wholesale+DUoS build-up is active, BAU pays the same tariff STRUCTURE as the optimised
-    # case (same wholesale shape, same DUoS bands) but keyed to its own size band's residual.
+    # When the wholesale+DUoS build-up is active, BAU pays the same tariff STRUCTURE 
+    # as the optimised case but keyed to its own size band's residual.
     if slot_prices:
         slot_c = import_price_slots_central(district, bau_elec_band["name"])
         num = sum(demand_kwh[(m, d)][t] * slot_c[(m, d, t)] * N_DAYS_OF[(m, d)]
@@ -931,11 +858,10 @@ def _bau_base(demand_kwh: dict, heat_kwh: dict, peak_kwth: float, horizon_years:
             "dem_y": dem_y, "nonimport_y": nonimport_y}
 
 
-def _bau_assemble(base: dict, horizon_years: int, scenario=None) -> dict:
+def _bau_assemble(base: dict, horizon_years: int, scenario) -> dict:
     # Apply one scenario's import-price path to the invariant BAU base.
     def im_price_y(y):
-        return base["base_central"] * float(scenario.path[y]) if scenario is not None \
-            else import_price(y, base["bau_base"])
+        return base["base_central"] * float(scenario.path[y])
     annual_undisc, npv = [], base["capex"]
     for y in range(horizon_years):
         annual = base["dem_y"][y] * im_price_y(y) + base["nonimport_y"][y]
@@ -949,9 +875,6 @@ def _bau_assemble(base: dict, horizon_years: int, scenario=None) -> dict:
 def _extract_results(prob, V: dict, status, district: str, activity: str, heating: str,
                      horizon_years: int) -> dict:
     if pulp.LpStatus[status] not in ("Optimal", "Not Solved"):
-        # Carry the land ceiling onto the stub row too — otherwise a horizontal loop that is
-        # Infeasible *because* the collector doesn't fit is indistinguishable from one that is
-        # Infeasible on grid headroom or economics.
         _lim = float(V.get("land_limit_kwth", float("inf")))
         return {"status": pulp.LpStatus[status], "district": district,
                 "activity": activity, "heating": heating,
@@ -978,7 +901,7 @@ def _extract_results(prob, V: dict, status, district: str, activity: str, heatin
         mu  = _wmean(d) if mean is None else mean
         return float(np.sqrt(np.average((arr - mu) ** 2, weights=ww)))
 
-    def _slot_sum(name, w, y, m, d):   # Σ over the 48 half-hour slots of a solved dispatch variable
+    def _slot_sum(name, w, y, m, d):   # sum over the 48 half-hour slots of a solved dispatch variable
         return sum(float(val(V[name][(w, y, m, d, t)]) or 0.0) for t in range(HH_PER_DAY))
 
     # Deterministic per-year maintenance + replacement (depend only on stage-1 sizing - same every scenario)
@@ -1136,8 +1059,7 @@ def _extract_results(prob, V: dict, status, district: str, activity: str, heatin
         "e_batt_kwh":            round(e_batt, 1),
         "o_batt_kw":             round(o_batt, 1),
         "q_heat_cap_kwth":       round(q_heat, 1),
-        # Horizontal-ground-loop land constraint. inf/None for every other heating type, so a blank
-        # here means "surface area was never a limit", not "not checked".
+        # Horizontal-ground-loop land constraint.
         "land_limit_kwth":       (None if not np.isfinite(_land_lim) else round(_land_lim, 1)),
         "land_limit_binds":      (bool(np.isfinite(_land_lim) and q_heat >= _land_lim - 1e-6)),
         "e_th_kwh":              round(e_th, 1),
@@ -1182,7 +1104,6 @@ def _extract_results(prob, V: dict, status, district: str, activity: str, heatin
 
 def solve_scenario(district: str, activity: str, heating: str = "Gas Boiler", *,
                    horizon_years: int = HORIZON_YEARS,
-                   use_binary_mutex: bool = False,
                    objective: str = "cost",
                    emissions_cap: float = None,
                    scenarios: list = None,
@@ -1194,20 +1115,16 @@ def solve_scenario(district: str, activity: str, heating: str = "Gas Boiler", *,
                    import_limit_override_kw: float = None) -> dict:
     # Build, solve, and extract metrics for one (district, activity, heating) TSSP instance.
     _ensure_dm_initialized()
-    # Short-circuit: a horizontal loop with zero available soft ground cannot produce any heat, so the
-    # LP is trivially infeasible. Skipping the build saves ~35 s/cell. The verdict is the same
-    # "Infeasible" a solver-proven cell gets; land_limit_kwth on the row carries the cause.
     _land_lim = land_limit_kwth(activity, heating)
     if _land_lim <= 0.0:
         return {"status": "Infeasible", "district": district, "activity": activity,
                 "heating": heating, "land_limit_kwth": 0.0}
-    prob, V = build_milp(district, activity, heating,
-                         horizon_years=horizon_years,
-                         use_binary_mutex=use_binary_mutex,
-                         objective=objective, emissions_cap=emissions_cap,
-                         scenarios=scenarios,
-                         demand_multiplier=demand_multiplier,
-                         import_limit_override_kw=import_limit_override_kw)
+    prob, V = build_lp(district, activity, heating,
+                       horizon_years=horizon_years,
+                       objective=objective, emissions_cap=emissions_cap,
+                       scenarios=scenarios,
+                       demand_multiplier=demand_multiplier,
+                       import_limit_override_kw=import_limit_override_kw)
     if solver is None:
         solver = _make_solver(solver_msg, time_limit_s, threads=threads)
     status = prob.solve(solver)
@@ -1228,17 +1145,10 @@ def pareto_front(district: str, activity: str, heating: str = "Gas Boiler", *,
     _ensure_dm_initialized()
     common = dict(horizon_years=horizon_years, time_limit_s=time_limit_s, solver_msg=solver_msg)
     cost_opt = solve_scenario(district, activity, heating, objective="cost", scenarios=scenarios, **common)
-    # The min-emissions anchor takes the same scenario set as the min-cost anchor and the eps sweep
-    # below. Without it the anchor fell back to central prices while every other point on the front
-    # carried the round's own set, so its cost could land BELOW the min-cost anchor — impossible on
-    # a real front, and enough to flip the non-dominated flags.
     emis_opt = solve_scenario(district, activity, heating, objective="emissions",
                               scenarios=scenarios, **common)
 
-    # Only sweep when both anchors are Optimal. A non-Optimal anchor returns a stub row that carries
-    # no metrics at all, so the emissions bounds must not be read until anchors_ok is known good —
-    # otherwise an infeasible heating (e.g. a land-capped horizontal loop) raises KeyError here and
-    # takes the whole featured-cell front down with it.
+    # Only sweep when both anchors are Optimal. 
     anchors_ok = cost_opt.get("status") == "Optimal" and emis_opt.get("status") == "Optimal"
     e_lo = e_hi = None
     if anchors_ok:
@@ -1257,8 +1167,6 @@ def pareto_front(district: str, activity: str, heating: str = "Gas Boiler", *,
             rows.append({**r, "pareto_point": f"eps-{i}", "emissions_cap_tco2e": round(cap_t, 1)})
     rows.append({**emis_opt, "pareto_point": "min-emissions", "emissions_cap_tco2e": None})
 
-    # When every row is a stub the metric columns are absent entirely — return unsorted rather than
-    # raise; featured_cell_front drops the non-Optimal rows immediately after.
     df = pd.DataFrame(rows)
     if "lifetime_emissions_tco2e" in df.columns:
         df = df.sort_values("lifetime_emissions_tco2e")
@@ -1266,9 +1174,22 @@ def pareto_front(district: str, activity: str, heating: str = "Gas Boiler", *,
     if verbose:
         print(f"\nCost/carbon Pareto front — {activity} / {heating} / {district}")
         cols = ["pareto_point", "total_cost_npv_GBP", "lifetime_emissions_tco2e",
-                "emissions_saving_fraction", "pv_kwp", "e_batt_kwh", "mac_GBP_per_tco2e"]
-        print(df[[c for c in cols if c in df.columns]].to_string(index=False))
+                "emissions_saving_fraction", "pv_kwp", "e_batt_kwh"]
+        out = df[[c for c in cols if c in df.columns]].copy()
+        out["step_mac_GBP_per_tco2e"] = _step_mac(df)
+        print(out.to_string(index=False))
     return df
+
+
+def _step_mac(df: pd.DataFrame) -> pd.Series:
+    # Marginal abatement cost of moving one step down the emissions axis of a frontier
+    need = {"total_cost_npv_GBP", "lifetime_emissions_tco2e"}
+    if not need <= set(df.columns) or df.empty:
+        return pd.Series([np.nan] * len(df), index=df.index)
+    c = pd.to_numeric(df["total_cost_npv_GBP"], errors="coerce")
+    e = pd.to_numeric(df["lifetime_emissions_tco2e"], errors="coerce")
+    d_emis = e.shift(-1) - e
+    return ((c - c.shift(-1)) / d_emis.where(d_emis.abs() > 1e-9)).round(1)
 
 
 # 6c - KNEE SELECTION
@@ -1307,6 +1228,9 @@ def featured_cell_front(district: str, activity: str, *, heatings: list = None,
     df = df[df["status"] == "Optimal"].copy().reset_index(drop=True)
     if df.empty:
         return df
+    _ref = gaspv_reference(df)
+    if not _ref.empty:
+        df = apply_gaspv_mac(df, _ref).reset_index(drop=True)
     df["pareto_optimal"] = _flag_pareto(df)
     df["is_knee"] = False
     pf = df[df["pareto_optimal"]]
@@ -1317,7 +1241,15 @@ def featured_cell_front(district: str, activity: str, *, heatings: list = None,
         cn = (c - c.min()) / (c.max() - c.min()) if c.max() > c.min() else c * 0.0
         en = (e - e.min()) / (e.max() - e.min()) if e.max() > e.min() else e * 0.0
         df.loc[np.hypot(cn, en).idxmin(), "is_knee"] = True
-    return df.sort_values("lifetime_emissions_tco2e").reset_index(drop=True)
+    df = df.sort_values("lifetime_emissions_tco2e").reset_index(drop=True)
+    if verbose:
+        print(f"\nPooled cost/carbon front — {activity} / {district}"
+              f"\n  MAC vs this cell's cost-optimal gas boiler + PV design "
+              f"(the gas anchor itself is NaN: it is the counterfactual)")
+        cols = ["heating", "pareto_point", "total_cost_npv_GBP", "lifetime_emissions_tco2e",
+                "emissions_saving_vs_gaspv_tco2e", "mac_GBP_per_tco2e", "pareto_optimal", "is_knee"]
+        print(df[[c for c in cols if c in df.columns]].to_string(index=False))
+    return df
 
 
 def knee_design(df_front: pd.DataFrame) -> dict:
@@ -1340,11 +1272,11 @@ def knee_design(df_front: pd.DataFrame) -> dict:
 
 # 7 - Rank all 9 × 4 × 4 combinations (district × activity × heating)
 def _solve_one_scenario(task: tuple) -> dict:
-    district, activity, heating, horizon_years, use_binary_mutex, time_limit_s, objective, threads, scenarios = task
+    district, activity, heating, horizon_years, time_limit_s, objective, threads, scenarios = task
     _ensure_dm_initialized()
     return solve_scenario(district, activity, heating,
-                          horizon_years=horizon_years, use_binary_mutex=use_binary_mutex,
-                          objective=objective, scenarios=scenarios, time_limit_s=time_limit_s, threads=threads)
+                          horizon_years=horizon_years, objective=objective,
+                          scenarios=scenarios, time_limit_s=time_limit_s, threads=threads)
 
 def _solve_tagged_scenario(tagged_task: tuple) -> dict:
     tag, task = tagged_task
@@ -1362,66 +1294,12 @@ def _print_scenario_row(i: int, n_total: int, row: dict, tag: str = None) -> Non
     else:
         print(f"{head} {row.get('status', 'ERROR')}")
 
-def rank_all_combinations(*, horizon_years: int = HORIZON_YEARS,
-                          use_binary_mutex: bool = False,
-                          objective: str = "cost",
-                          activities: list = None,
-                          districts: list = None,
-                          heatings: list = None,
-                          verbose: bool = True,
-                          time_limit_s: int = DEFAULT_TIME_LIMIT_S,
-                          n_jobs: int = PARALLEL_JOBS,
-                          scenarios: list = None) -> pd.DataFrame:
-    # Solve every (district, activity, heating) scenario under one objective and rank vs the common BAU.
-    # scenarios = explicit import-price scenario set passed to every cell.
-    # The cells are independent, so they are solved in parallel across n_jobs processes
-    _ensure_dm_initialized()
-    activities = activities or list(ROOF_PROPERTIES.keys())
-    districts  = districts  or list(dm.DISTRICT_STATIONS.keys())
-    heatings   = heatings   or list(dm.HEATING_OPTIONS)
-    n_total = len(activities) * len(districts) * len(heatings)
-    logical = os.cpu_count() or 2
-    # Default to HALF of physical cores (≈ logical/4 on SMT CPUs).
-    if n_jobs is None:
-        n_jobs = max(1, logical // 4)
-    n_jobs = max(1, min(n_jobs, n_total))
-    threads_per_worker = SOLVER_THREADS or max(1, logical // n_jobs)
-    tasks = [(d, a, h, horizon_years, use_binary_mutex, time_limit_s, objective, threads_per_worker, scenarios)
-             for a in activities for d in districts for h in heatings]
-
-    rows = []
-    if n_jobs == 1:
-        solver = _make_solver(solver_msg=False, time_limit_s=time_limit_s)
-        for i, (d, a, h, *_rest) in enumerate(tasks, 1):
-            row = solve_scenario(d, a, h, horizon_years=horizon_years,
-                                 use_binary_mutex=use_binary_mutex, objective=objective,
-                                 scenarios=scenarios, solver=solver)
-            rows.append(row)
-            if verbose:
-                _print_scenario_row(i, n_total, row)
-    else:
-        if verbose:
-            print(f"Solving {n_total} scenarios ({objective}) across {n_jobs} processes "
-                  f"× {threads_per_worker} solver threads (of {logical} logical cores) …")
-        with mp.Pool(processes=n_jobs) as pool:
-            for i, row in enumerate(pool.imap_unordered(_solve_one_scenario, tasks), 1):
-                rows.append(row)
-                if verbose:
-                    _print_scenario_row(i, n_total, row)
-
-    sort_col = "emissions_saving_tco2e" if objective == "emissions" else "npv_savings_GBP"
-    df = pd.DataFrame(rows)
-    if sort_col in df.columns:   # absent only if every cell in this sweep failed to solve
-        df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
-    return df
-
-
 def _run_merged_sweep(specs: list, *, activities: list = None, districts: list = None,
                       heatings: list = None, horizon_years: int = HORIZON_YEARS,
-                      use_binary_mutex: bool = False, verbose: bool = True,
+                      verbose: bool = True,
                       time_limit_s: int = DEFAULT_TIME_LIMIT_S, n_jobs: int = PARALLEL_JOBS) -> dict:
-    # Solve several independent sweeps through ONE shared worker pool instead of one rank_all_combinations() pool per sweep. 
-    # Each spec is {"tag": str, "objective": "cost"|"emissions", "scenarios": list|None, "sort_col": str}.
+    # Solve every (district, activity, heating) cell for each spec, all through one shared worker
+    # pool rather than a separate pool per sweep. Returns {spec tag: ranked DataFrame}.
     _ensure_dm_initialized()
     activities = activities or list(ROOF_PROPERTIES.keys())
     districts  = districts  or list(dm.DISTRICT_STATIONS.keys())
@@ -1429,15 +1307,11 @@ def _run_merged_sweep(specs: list, *, activities: list = None, districts: list =
     n_per_spec = len(activities) * len(districts) * len(heatings)
     n_total    = n_per_spec * len(specs)
     logical    = os.cpu_count() or 2
-    # Half of physical cores, not the full physical-core count — see rank_all_combinations() above.
-    if n_jobs is None:
-        n_jobs = max(1, logical // 4)
-    n_jobs = max(1, min(n_jobs, n_total))
-    threads_per_worker = SOLVER_THREADS or max(1, logical // n_jobs)
+    n_jobs, threads_per_worker = resolve_jobs(n_jobs, n_total)
 
     tagged_tasks = []
     for spec in specs:
-        tasks = [(d, a, h, horizon_years, use_binary_mutex, time_limit_s, spec["objective"],
+        tasks = [(d, a, h, horizon_years, time_limit_s, spec["objective"],
                   threads_per_worker, spec["scenarios"])
                  for a in activities for d in districts for h in heatings]
         tagged_tasks.extend((spec["tag"], t) for t in tasks)
@@ -1474,7 +1348,6 @@ def _run_merged_sweep(specs: list, *, activities: list = None, districts: list =
 def assemble_pareto(df_npv: pd.DataFrame, df_carbon: pd.DataFrame) -> pd.DataFrame:
     # Combine the cost-min and emissions-min sweeps into the cost/carbon trade-off set. 
     # A design is dominated if another has <= NPV cost AND <= emissions, with at least one strictly better. 
-    # Both objective sweeps already carry full cost + emissions columns.
     a = df_npv.assign(source_objective="cost")
     b = df_carbon.assign(source_objective="emissions")
     df = pd.concat([a, b], ignore_index=True)
@@ -1496,6 +1369,69 @@ def assemble_pareto(df_npv: pd.DataFrame, df_carbon: pd.DataFrame) -> pd.DataFra
                           ascending=[False, True]).reset_index(drop=True)
 
 
+# Primary energy factors [kWh primary / kWh delivered] — model_parameters.xlsx: Scalars sheet,
+# PRIMARY_ENERGY_FACTOR [electricity] / [gas] rows (imported above).
+_PE_NEED = {"annual_import_kwh", "annual_export_kwh", "annual_gas_kwh"}
+
+
+def primary_energy_kwh(df: pd.DataFrame):
+    # Annual primary energy behind each design (kWh/yr): net grid electricity + gas, each at its factor. 
+    if df is None or df.empty or not _PE_NEED <= set(df.columns):
+        return None
+    num = lambda c: pd.to_numeric(df[c], errors="coerce")
+    return ((num("annual_import_kwh") - num("annual_export_kwh")) * PRIMARY_ENERGY_FACTORS["electricity"]
+            + num("annual_gas_kwh") * PRIMARY_ENERGY_FACTORS["gas"])
+
+
+def gaspv_reference(df_npv: pd.DataFrame) -> pd.DataFrame:
+    # MAC is measured against the cost-optimal gas-boiler design per (district, activity):
+    # This isolates the MAC of installing a heat pump.
+    need = {"district", "activity", "heating", "status",
+            "total_cost_npv_GBP", "lifetime_emissions_tco2e"}
+    empty = pd.DataFrame(columns=["district", "activity", "ref_cost_npv_GBP", "ref_emissions_tco2e"])
+    if df_npv is None or df_npv.empty or not need <= set(df_npv.columns):
+        return empty
+    g = df_npv[(df_npv["status"] == "Optimal") & (df_npv["heating"] == "Gas Boiler")]
+    if g.empty:
+        return empty
+    g = (g.sort_values("total_cost_npv_GBP")
+           .drop_duplicates(subset=["district", "activity"], keep="first"))
+    out = (g[["district", "activity", "total_cost_npv_GBP", "lifetime_emissions_tco2e"]]
+           .rename(columns={"total_cost_npv_GBP":       "ref_cost_npv_GBP",
+                            "lifetime_emissions_tco2e": "ref_emissions_tco2e"})
+           .reset_index(drop=True))
+    # HP change in primary energy is measured against the same counterfactual that MAC is.
+    pe = primary_energy_kwh(g)
+    if pe is not None:
+        out["ref_primary_energy_kwh"] = pe.reset_index(drop=True)
+    return out
+
+
+def apply_gaspv_mac(df: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFrame:
+    # Rebase mac_GBP_per_tco2e onto the gas+PV counterfactual of gaspv_reference(). 
+    if df is None or df.empty or ref is None or ref.empty:
+        return df
+    out = df.copy()
+    if "mac_GBP_per_tco2e" in out.columns and "mac_vs_bau_GBP_per_tco2e" not in out.columns:
+        out["mac_vs_bau_GBP_per_tco2e"] = out["mac_GBP_per_tco2e"]
+    need = {"district", "activity", "total_cost_npv_GBP", "lifetime_emissions_tco2e"}
+    if not need <= set(out.columns):
+        return out                      # e.g. the per-cell frontier table, which carries no cell keys
+    out = out.merge(ref, on=["district", "activity"], how="left")
+    d_cost = out["total_cost_npv_GBP"] - out["ref_cost_npv_GBP"]
+    d_emis = out["ref_emissions_tco2e"] - out["lifetime_emissions_tco2e"]
+    out["emissions_saving_vs_gaspv_tco2e"] = d_emis.round(1)
+    out["mac_GBP_per_tco2e"] = (d_cost / d_emis.where(d_emis.abs() > 1e-9)).round(1)
+    # Change in annual primary energy against the same counterfactual.
+    pe = primary_energy_kwh(out)
+    if pe is not None and "ref_primary_energy_kwh" in out.columns:
+        ref_pe = pd.to_numeric(out["ref_primary_energy_kwh"], errors="coerce")
+        out["primary_energy_change_kwh"] = (pe - ref_pe).round(0)
+        out["primary_energy_change_pct"] = ((pe / ref_pe.where(ref_pe.abs() > 1e-9) - 1.0) * 100).round(1)
+    return out.drop(columns=[c for c in ("ref_cost_npv_GBP", "ref_emissions_tco2e",
+                                         "ref_primary_energy_kwh") if c in out.columns])
+
+
 # 8 - REPORT
 def write_results_workbook(dfs: dict, out_path: str, run_meta: dict = None,
                            scenarios: list = None, grid_sensitivity: pd.DataFrame = None) -> None:
@@ -1505,9 +1441,7 @@ def write_results_workbook(dfs: dict, out_path: str, run_meta: dict = None,
     scen = scenarios if scenarios is not None else price_scenarios()
     meta = {
         "n_scenarios":   len(df_npv),
-        # Cells the solver returned a design for. The complement is Infeasible — physically
-        # impossible cells (e.g. a horizontal ground loop with no room for the collector), not
-        # solver failures — so the cover reports this as "feasible", not "optimal".
+        # Cells the solver returned a design for.
         "n_feasible":    int((df_npv["status"] == "Optimal").sum()) if "status" in df_npv else len(df_npv),
         "horizon_years": HORIZON_YEARS,
         "discount_rate": TECH_COSTS["discount_rate"],
@@ -1565,9 +1499,8 @@ def write_results_workbook(dfs: dict, out_path: str, run_meta: dict = None,
     print(f"  + {len(pngs)} charts in {charts_dir}")
 
 
-# 9 - main()
+# 9 - RUN METADATA
 def _osm_survey_info() -> str:
-    # One-line provenance for the OSM roof data the model consumes, plus a refresh prompt.
     if not os.path.exists(OSM_STOREYS_XLSX):
         return (f"OSM roof survey not found at {OSM_STOREYS_XLSX}.\n"
                 f"  Run api_osm_storeys.py to generate the storey + roof-shape data before optimising.")

@@ -1,7 +1,6 @@
 """
 Import-only, by demand_profile_model, optimisation_model, optimisation_report. 
-
-Loads data/Model_Parameters.xlsx and reconstructs the parameter structures, with no hardcoded fallback.
+Loads data/model_parameters.xlsx and reconstructs the parameter structures.
 
 Each sheet has its header on row 4 and data from row 5. Column A is either "Line" (flat, scalar sheets) 
 or an index column (Scope / Technology / Month — per-activity / per-tech / per-month sheets). 
@@ -14,11 +13,11 @@ import numpy as np
 import openpyxl
 
 PARAMS_XLSX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "data", "Model_Parameters.xlsx")
+                           "data", "model_parameters.xlsx")
 
 
 def _num(v):
-    # Whole-number floats -> int (so year/index params can index lists); other numbers untouched.
+    # Whole-number floats -> int (so year/index params can index lists).
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)) and float(v).is_integer():
@@ -61,8 +60,8 @@ def load_params(path=PARAMS_XLSX):
     wb.close()
 
     # REAL-TERMS REBASING
-    # The model is a real-terms appraisal (real discount rate; general_inflation = 0), but cost inputs were sourced in different real base years. 
-    # Any row carrying a 'Price Base Year' is rebased to TARGET_PRICE_YEAR using the UK GDP deflator (HM Treasury Green Book convention), 
+    # The model is a real-terms appraisal, but cost inputs were sourced in different real base years. 
+    # Any row carrying a 'Price Base Year' is rebased to TARGET_PRICE_YEAR using the HM Treasury UK GDP deflator, 
     # factor = deflator[target]/deflator[base].
     # This is not forward inflation (real prices stay flat over the horizon; the real discount rate handles time value).
     TARGET_PRICE_YEAR = 2025
@@ -113,8 +112,20 @@ def load_params(path=PARAMS_XLSX):
         direction, district = m.group(1).lower(), m.group(2)
         grid_limits.setdefault(district, {})[f"{direction}_kw"] = float(val)
 
+    # Primary energy factors: 'PRIMARY_ENERGY_FACTOR [<carrier>]' rows on the Scalars sheet
+    # (NCM Modelling Guide, kWh primary / kWh delivered). Reporting only - not in OF1 or OF2.
+    pef_re = re.compile(r"^PRIMARY_ENERGY_FACTOR \[(.+)\]$")
+    primary_energy_factors = {}
+    for key in list(scal.keys()):
+        m = pef_re.match(str(key))
+        if not m:
+            continue
+        val = scal.pop(key)
+        if val in (None, ""):
+            continue
+        primary_energy_factors[m.group(1)] = float(val)
+
     # PV: single-value rows, plus const_per_kwp + infra_per_kwp as Low/Central/High scenarios (DESNZ).
-    # capex_per_kwp is DERIVED = active const + active infra (so the model still reads one capex_per_kwp).
     pv, pv_const, pv_infra = {}, {}, {}
     pv_keyed, pv_active = {}, {}            # other Low/Central/High scalars (e.g. maint_per_mw_per_yr)
     for d in R["PV"]:
@@ -145,15 +156,14 @@ def load_params(path=PARAMS_XLSX):
     tech_costs = {**scal, "pv": pv, "battery": batt}
 
     # Electricity & gas prices live on one 'Energy Prices' sheet, split by the Group column:
-    #   Electricity Import  -> size-band import price (auto-selected by demand; Min/Max MWh thresholds)
-    #   Gas Import          -> size-band gas price    (auto-selected by demand; Min/Max MWh thresholds)
-    #   Electricity Export  -> SEG export price scenarios (Active-flagged)
-    #   Energy Price Growth -> real elec/gas escalation scenarios (Active-flagged)
+    #   Electricity Import    -> size-band import price (auto-selected by demand; Min/Max MWh thresholds)
+    #   Gas Import            -> size-band gas price    (auto-selected by demand; Min/Max MWh thresholds)
+    #   Electricity Export    -> SEG export price scenarios (Active-flagged)
+    #   Energy Price Growth   -> real elec/gas escalation scenarios (Active-flagged)
     #   Import Price Scenario -> Low/Central/High level multipliers (x Central 2025 band price)
-    #                            for elec & gas imports (Active-flagged). This is a present-day
-    #                            level band; it is INDEPENDENT of the Energy Price Growth scenario
-    #                            (the latter governs the forward escalation), so the two may be set
-    #                            separately. Central = 1.0 leaves the DESNZ 2025 band actuals unchanged.
+    #                            for elec & gas imports (Active-flagged). This is a present-day level band 
+    #                            (independent of the Energy Price Growth scenario, so the two may be set separately). 
+    #                            Central = 1.0 leaves the DESNZ 2025 band actuals unchanged.
     elec_bands, gas_bands = [], []
     export_scen, export_active = {}, None
     growth_scen, growth_active = {}, None
@@ -184,9 +194,7 @@ def load_params(path=PARAMS_XLSX):
     tech_costs["elec_price_growth"] = growth_scen[growth_active]["elec_price_growth"]
     tech_costs["gas_price_growth"]  = growth_scen[growth_active]["gas_price_growth"]
 
-    # Apply the active import-price level multiplier to every size band's price. Missing group
-    # (older workbooks) -> 1.0, i.e. unchanged. Baked into band["price"] here so select_*_band()
-    # returns scenario-adjusted prices with no downstream change; growth/escalation is applied separately.
+    # Apply the active import-price level multiplier to every size band's price.
     import_active = import_active or "Central"
     imp = import_mult_scen.get(import_active, {})
     elec_import_mult = float(imp.get("elec_import_multiplier", 1.0))
@@ -266,6 +274,7 @@ def load_params(path=PARAMS_XLSX):
         "ELEC_EMISSION_FACTORS":     elec_ef,
         "CARBON_VALUES":             carbon_val,
         "GRID_LIMITS":               grid_limits,
+        "PRIMARY_ENERGY_FACTORS":    primary_energy_factors,
         "ELEC_IMPORT_BANDS":         elec_bands,
         "GAS_IMPORT_BANDS":          gas_bands,
         "ELEC_EXPORT_SCENARIOS":     export_scen,
@@ -291,7 +300,7 @@ def load_params(path=PARAMS_XLSX):
         "SOIL_THERMAL_DIFFUSIVITY_M2_S": float(ground["SOIL_THERMAL_DIFFUSIVITY_M2_S"]),
         "SURFACE_TEMP_PEAK_DOY":         ground["SURFACE_TEMP_PEAK_DOY"],
         "BRINE_OFFSET_C":                float(ground["BRINE_OFFSET_C"]),
-        "DEFAULT_BRINE_TEMP_C":          float(ground["DEFAULT_BRINE_TEMP_C"]),
+        "DEFAULT_GROUND_TEMP_C":         float(ground["DEFAULT_GROUND_TEMP_C"]),
         # Horizontal-loop land constraint (vertical boreholes need negligible surface area).
         "HORIZONTAL_COLLECTOR_M2_PER_KWTH": float(ground["HORIZONTAL_COLLECTOR_M2_PER_KWTH"]),
         "SITE_PLOT_RATIO":                  float(ground["SITE_PLOT_RATIO"]),
@@ -315,6 +324,7 @@ __all__ = [
     "TECH_COSTS", "HEAT_COSTS", "THERMAL_STORE", "ROOF_PROPERTIES",
     "ROOF_LOAD_KG_PER_M2", "ROOF_PITCH_DEG", "PITCHED_USABLE_SLOPE_FRAC",
     "DISTRICT_MONTHLY_GHI", "GRID_LIMITS", "select_grid_limit",
+    "PRIMARY_ENERGY_FACTORS",
     "GAS_EMISSION_FACTOR", "ELEC_EMISSION_FACTORS", "CARBON_VALUES",
     "EMISSIONS_BASE_YEAR", "elec_emission_factor", "carbon_value",
     "ELEC_IMPORT_BANDS", "select_elec_band",
@@ -329,13 +339,13 @@ __all__ = [
     "T_ASHP_MIN", "T_ASHP_MAX", "T_GSHP_MIN", "T_GSHP_MAX",
     "HORIZONTAL_COLLECTOR_M2_PER_KWTH", "SITE_PLOT_RATIO", "PARKING_GROSS_M2_PER_SPACE",
     "HORIZONTAL_LOOP_DEPTH_M", "SOIL_THERMAL_DIFFUSIVITY_M2_S", "SURFACE_TEMP_PEAK_DOY",
-    "BRINE_OFFSET_C", "DEFAULT_BRINE_TEMP_C",
+    "BRINE_OFFSET_C", "DEFAULT_GROUND_TEMP_C",
     "EV_CHARGER_KW", "EV_SPACE_FRACTION", "EV_PARKING_DENSITY", "EV_DWELL_HOURS",
     "PEAK_FRACTION", "T_SETBACK", "HDD_BASE", "UK_LATITUDE",
     "DIURNAL_AMPLITUDE", "SEASON_DOY", "WE_LOAD_FACTOR",
 ]
 
-# Bind every parameter as a module attribute so callers can `from model_params import TECH_COSTS, ...`
+# Bind every parameter as a module attribute so callers can import specific attributes from the module
 globals().update(load_params())
 
 

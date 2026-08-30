@@ -1,7 +1,5 @@
 """
-Import-only.
-
-Demand-growth and climate trajectories over the optimisation horizon.
+Import-only. Projects demand-growth and climate trajectories over the optimisation horizon.
   - Non-heat electricity grows per the DESNZ Reference projection (electricity_projection_output.csv).
   - Heat demand falls as climate warms, per the UKCP18 HDD projection (climate_projection_output.csv): scaled by projected_hdd/baseline_hdd per district-month.
 COP improves over the horizon as climate warms; heat-pump electricity falls from both lower heat demand and higher COP.
